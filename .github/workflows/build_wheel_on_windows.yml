@@ -107,6 +107,7 @@ jobs:
         shell: powershell
         run: |
           # 1. Generate and capture the version from setuptools_scm
+          pip install setuptools-scm
           $SCM_VERSION = python -m setuptools_scm
           echo "Detected Version: $SCM_VERSION"
           "zvec version: $version" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
