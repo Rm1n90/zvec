@@ -95,12 +95,12 @@ jobs:
         run: echo "C:\Program Files\Git\usr\bin" >> $env:GITHUB_PATH
         shell: powershell
 
-      - name: Cache built wheels
-        id: cache-wheels
-        uses: actions/cache@v4
-        with:
-          path: wheelhouse
-          key: ${{ runner.os }}-wheels-${{ hashFiles('**/pyproject.toml', '**/setup.py', '**/*.py', '**/*.c', '**/*.cpp') }}
+      #      - name: Cache built wheels
+      #        id: cache-wheels
+      #        uses: actions/cache@v4
+      #        with:
+      #          path: wheelhouse
+      #          key: ${{ runner.os }}-wheels-${{ hashFiles('**/pyproject.toml', '**/setup.py', '**/*.py', '**/*.c', '**/*.cpp') }}
 
       - name: Build wheels using cibuildwheel
         if: steps.cache-wheels.outputs.cache-hit != 'true'
