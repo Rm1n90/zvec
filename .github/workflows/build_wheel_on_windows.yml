@@ -112,6 +112,7 @@ jobs:
 #          CIBW_DEBUG_TRACEBACK: 1
 #          CIBW_DEBUG_KEEP_CONTAINER: 1
         run: |
+          python -m setuptools_scm
           python -m cibuildwheel --output-dir wheelhouse
 
       - name: Install and test wheel
