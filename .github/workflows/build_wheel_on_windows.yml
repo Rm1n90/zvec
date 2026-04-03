@@ -64,7 +64,7 @@ jobs:
           where cl
           & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -prerelease -format json
         shell: powershell
-        
+
       - name: Enable git long paths
         shell: powershell
         run: git config --global core.longpaths true
@@ -90,11 +90,6 @@ jobs:
         with:
           arch: x64
 
-      - name: Install cibuildwheel
-        run: |
-          pip install --upgrade pip
-          pip install cibuildwheel==3.4.0
-
       - name: Add Git bin to PATH
         run: echo "C:\Program Files\Git\usr\bin" >> $env:GITHUB_PATH
         shell: powershell
@@ -111,7 +106,9 @@ jobs:
         shell: powershell
         run: |
           # 1. Generate and capture the version from setuptools_scm
-          pip install setuptools-scm
+          pip install --upgrade pip
+          pip install cibuildwheel==3.4.0
+          pip install setuptools-scm>=8.0
           $SCM_VERSION = python -m setuptools_scm
           echo "Detected Version: $SCM_VERSION"
           "zvec version: $version" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
