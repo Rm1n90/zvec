@@ -109,6 +109,7 @@ jobs:
           # 1. Generate and capture the version from setuptools_scm
           $SCM_VERSION = python -m setuptools_scm
           echo "Detected Version: $SCM_VERSION"
+          "zvec version: $version" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           
           # 2. Set it as an environment variable for the current shell and subsequent steps
           $env:SETUPTOOLS_SCM_PRETEND_VERSION = $SCM_VERSION
