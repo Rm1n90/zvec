@@ -105,11 +105,12 @@ jobs:
       - name: Build wheels using cibuildwheel
         if: steps.cache-wheels.outputs.cache-hit != 'true'
         shell: powershell
-#        env:
+        env:
+          # If this workflow is triggered by a tag, then just use it
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 #          CIBW_BUILD_VERBOSITY: 1
 #          CIBW_DEBUG_TRACEBACK: 1
 #          CIBW_DEBUG_KEEP_CONTAINER: 1
-
         run: |
           python -m cibuildwheel --output-dir wheelhouse
 
@@ -190,6 +191,11 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ python-version }}
+
       - name: Smoke test from PyPI
         shell: powershell
         env:
@@ -217,7 +223,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           $found = $false
           for ($i = 1; $i -le 30; $i++) {
-            python -m pip install --force-reinstall @indexArgs --dry-run "zvec==$version" 1>$null 2>$null
+            python -m pip install --force-reinstall @indexArgs --dry-run "zvec==$version"
             if ($LASTEXITCODE -eq 0) {
               Write-Host "Version $version is available."
               $found = $true
