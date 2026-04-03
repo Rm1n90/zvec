@@ -64,6 +64,10 @@ jobs:
           where cl
           & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -prerelease -format json
         shell: powershell
+        
+      - name: Enable git long paths
+        shell: powershell
+        run: git config --global core.longpaths true
 
       - name: Checkout code
         uses: actions/checkout@v6
