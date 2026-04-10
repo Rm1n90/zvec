@@ -125,8 +125,15 @@ sys.exit(1)
     echo "--- Running ${TEST_NAME} ---"
     xcrun simctl install "$DEVICE_ID" "$APP"
     set +e
-    xcrun simctl launch --console "$DEVICE_ID" "$BUNDLE_ID" 2>&1 | tee /tmp/${TEST_NAME}.log
-    LAUNCH_EXIT=${PIPESTATUS[0]}
+    for attempt in 1 2 3; do
+      xcrun simctl launch --console "$DEVICE_ID" "$BUNDLE_ID" 2>&1 | tee /tmp/${TEST_NAME}.log
+      LAUNCH_EXIT=${PIPESTATUS[0]}
+      if ! grep -q "unknown to FrontBoard" /tmp/${TEST_NAME}.log; then
+        break
+      fi
+      echo "Attempt ${attempt}/3: FrontBoard has not registered ${TEST_NAME} yet, retrying in 3s..."
+      sleep 3
+    done
     set -e
 
     if grep -q '\[  FAILED  \]' /tmp/${TEST_NAME}.log; then

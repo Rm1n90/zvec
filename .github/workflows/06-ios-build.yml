@@ -117,8 +117,15 @@ jobs:
             echo "::group::Running ${TEST_NAME}"
             xcrun simctl install "$DEVICE_ID" "$APP"
             set +eo pipefail
-            xcrun simctl launch --console "$DEVICE_ID" "$BUNDLE_ID" 2>&1 | tee /tmp/${TEST_NAME}.log
-            LAUNCH_EXIT=${PIPESTATUS[0]}
+            for attempt in 1 2 3; do
+              xcrun simctl launch --console "$DEVICE_ID" "$BUNDLE_ID" 2>&1 | tee /tmp/${TEST_NAME}.log
+              LAUNCH_EXIT=${PIPESTATUS[0]}
+              if ! grep -q "unknown to FrontBoard" /tmp/${TEST_NAME}.log; then
+                break
+              fi
+              echo "::warning::Attempt ${attempt}/3: FrontBoard has not registered ${TEST_NAME} yet, retrying in 3s..."
+              sleep 3
+            done
             set -eo pipefail
 
             if grep -q '\[  FAILED  \]' /tmp/${TEST_NAME}.log; then
