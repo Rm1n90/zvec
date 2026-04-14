@@ -18,6 +18,7 @@
 #include <regex>
 #include <stdexcept>
 #include <zvec/ailego/internal/platform.h>
+#include <zvec/db/config.h>
 #include <zvec/db/doc.h>
 #include "db/common/constants.h"
 #include "db/index/common/type_helper.h"
@@ -1202,9 +1203,10 @@ bool Doc::operator==(const Doc &other) const {
 }
 
 Status VectorQuery::validate(const FieldSchema *schema) const {
-  if ((uint32_t)topk_ > kMaxQueryTopk) {
+  uint32_t max_topk = GlobalConfig::Instance().max_query_topk();
+  if ((uint32_t)topk_ > max_topk) {
     return Status::InvalidArgument("query validate failed: topk[", topk_,
-                                   "] is too large, max is ", kMaxQueryTopk);
+                                   "] is too large, max is ", max_topk);
   }
   if (output_fields_.has_value() &&
       output_fields_->size() > kMaxOutputFieldSize) {

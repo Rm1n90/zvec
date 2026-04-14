@@ -37,6 +37,7 @@ GlobalConfig::ConfigData::ConfigData()
       query_thread_count(CgroupUtil::getCpuLimit()),
       invert_to_forward_scan_ratio(0.9),
       brute_force_by_keys_ratio(0.1),
+      max_query_topk(kMaxQueryTopk),
       optimize_thread_count(CgroupUtil::getCpuLimit()) {}
 
 Status GlobalConfig::Validate(const ConfigData &config) const {
@@ -67,6 +68,11 @@ Status GlobalConfig::Validate(const ConfigData &config) const {
       config.brute_force_by_keys_ratio > 1.0f) {
     return Status::InvalidArgument(
         "brute_force_by_keys_ratio must be between 0 and 1");
+  }
+
+  // Validate max_query_topk
+  if (config.max_query_topk == 0) {
+    return Status::InvalidArgument("max_query_topk must be greater than 0");
   }
 
   // Validate optimize thread count

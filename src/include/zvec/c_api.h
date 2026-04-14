@@ -697,6 +697,24 @@ zvec_config_data_set_optimize_thread_count(zvec_config_data_t *config,
 ZVEC_EXPORT uint32_t ZVEC_CALL
 zvec_config_data_get_optimize_thread_count(const zvec_config_data_t *config);
 
+/**
+ * @brief Set max query topk in configuration data
+ * @param config Configuration data pointer
+ * @param max_topk Maximum allowed topk value for queries
+ * @return zvec_error_code_t Error code
+ */
+ZVEC_EXPORT zvec_error_code_t ZVEC_CALL
+zvec_config_data_set_max_query_topk(zvec_config_data_t *config,
+                                    uint32_t max_topk);
+
+/**
+ * @brief Get max query topk from configuration data
+ * @param config Configuration data pointer
+ * @return uint32_t Max query topk
+ */
+ZVEC_EXPORT uint32_t ZVEC_CALL
+zvec_config_data_get_max_query_topk(const zvec_config_data_t *config);
+
 // =============================================================================
 // Initialization and Cleanup Interface
 // =============================================================================

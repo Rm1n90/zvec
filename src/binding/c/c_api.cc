@@ -648,6 +648,27 @@ uint32_t zvec_config_data_get_optimize_thread_count(
   return cpp_config->optimize_thread_count;
 }
 
+zvec_error_code_t zvec_config_data_set_max_query_topk(
+    zvec_config_data_t *config, uint32_t max_topk) {
+  if (!config) {
+    SET_LAST_ERROR(ZVEC_ERROR_INVALID_ARGUMENT, "Config pointer is null");
+    return ZVEC_ERROR_INVALID_ARGUMENT;
+  }
+  auto *cpp_config = reinterpret_cast<zvec::GlobalConfig::ConfigData *>(config);
+  cpp_config->max_query_topk = max_topk;
+  return ZVEC_OK;
+}
+
+uint32_t zvec_config_data_get_max_query_topk(
+    const zvec_config_data_t *config) {
+  if (!config) {
+    return 1024;
+  }
+  auto *cpp_config =
+      reinterpret_cast<const zvec::GlobalConfig::ConfigData *>(config);
+  return cpp_config->max_query_topk;
+}
+
 
 // =============================================================================
 // Initialization and cleanup interface implementation

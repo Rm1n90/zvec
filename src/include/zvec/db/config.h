@@ -92,6 +92,7 @@ class GlobalConfig : public ailego::Singleton<GlobalConfig> {
     uint32_t query_thread_count;
     float invert_to_forward_scan_ratio;
     float brute_force_by_keys_ratio;
+    uint32_t max_query_topk;
 
     // optimize
     uint32_t optimize_thread_count;
@@ -159,6 +160,11 @@ class GlobalConfig : public ailego::Singleton<GlobalConfig> {
   //! Brute force by keys ratio
   float brute_force_by_keys_ratio() const noexcept {
     return config_.brute_force_by_keys_ratio;
+  }
+
+  //! Max query topk
+  uint32_t max_query_topk() const noexcept {
+    return config_.max_query_topk;
   }
 
   //! Optimize thread count
