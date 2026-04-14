@@ -39,6 +39,7 @@ def init(
     invert_to_forward_scan_ratio: Optional[float] = None,
     brute_force_by_keys_ratio: Optional[float] = None,
     memory_limit_mb: Optional[int] = None,
+    max_query_topk: Optional[int] = None,
 ) -> None:
     """Initialize Zvec with configuration options.
 
@@ -93,6 +94,11 @@ def init(
             approaching this limit.
             If ``None``, inferred from cgroup memory limit * 0.8 (e.g., in Docker).
             Must be > 0 if provided.
+        max_query_topk (Optional[int], optional):
+            Maximum allowed ``topk`` value in ``collection.query()``.
+            Default: ``1024``. Raise this when you need to retrieve more
+            results per query and accept the extra memory/latency cost.
+            Must be ≥ 1 if provided.
 
     Raises:
         RuntimeError: If Zvec is already initialized.
@@ -159,6 +165,12 @@ def init(
         config_dict["brute_force_by_keys_ratio"] = brute_force_by_keys_ratio
     if memory_limit_mb is not None:
         config_dict["memory_limit_mb"] = memory_limit_mb
+    if max_query_topk is not None:
+        if not isinstance(max_query_topk, int) or isinstance(max_query_topk, bool):
+            raise TypeError("max_query_topk must be an integer")
+        if max_query_topk < 1:
+            raise ValueError("max_query_topk must be >= 1")
+        config_dict["max_query_topk"] = max_query_topk
 
     Initialize(config_dict)
 
