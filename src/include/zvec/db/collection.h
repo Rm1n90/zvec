@@ -98,6 +98,15 @@ class Collection {
 
   virtual Result<DocPtrList> Query(const VectorQuery &query) const = 0;
 
+  /**
+   * @brief Run a full-text-search (BM25) query.
+   *
+   * The query targets a single STRING field that was declared with an
+   * FTS index in the collection schema. Top-K is computed globally across
+   * all segments. Deleted documents are excluded.
+   */
+  virtual Result<DocPtrList> QueryText(const TextQuery &query) const = 0;
+
   virtual Result<GroupResults> GroupByQuery(
       const GroupByVectorQuery &query) const = 0;
 

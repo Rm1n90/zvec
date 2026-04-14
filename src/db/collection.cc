@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 #include <ailego/io/file_lock.h>
@@ -115,6 +117,8 @@ class CollectionImpl : public Collection {
   Status DeleteByFilter(const std::string &filter) override;
 
   Result<DocPtrList> Query(const VectorQuery &query) const override;
+
+  Result<DocPtrList> QueryText(const TextQuery &query) const override;
 
   Result<GroupResults> GroupByQuery(
       const GroupByVectorQuery &query) const override;
@@ -1588,6 +1592,106 @@ Result<DocPtrList> CollectionImpl::Query(const VectorQuery &query) const {
   }
 
   return sql_engine_->execute(schema_, query, segments);
+}
+
+Result<DocPtrList> CollectionImpl::QueryText(const TextQuery &query) const {
+  std::shared_lock lock(schema_handle_mtx_);
+
+  CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
+
+  // Validate against the (forward) field schema.
+  auto *field_schema = schema_->get_forward_field(query.field_name_);
+  auto vs = query.validate(field_schema);
+  CHECK_RETURN_STATUS_EXPECTED(vs);
+
+  auto segments = get_all_segments();
+  if (segments.empty() || query.topk_ <= 0) {
+    return DocPtrList();
+  }
+
+  const auto fts_op =
+      query.op_ == TextQuery::MatchOp::AND ? FtsColumnIndexer::MatchOp::AND
+                                           : FtsColumnIndexer::MatchOp::OR;
+  const std::size_t per_segment_topk = static_cast<std::size_t>(query.topk_);
+
+  // Per-segment search → (segment_ptr, global_doc_id, score) tuples.
+  struct GlobalHit {
+    Segment::Ptr segment;
+    uint64_t global_doc_id;
+    float score;
+  };
+  std::vector<GlobalHit> hits;
+
+  for (const auto &segment : segments) {
+    if (!segment) {
+      continue;
+    }
+    auto fts = segment->get_fts_indexer(query.field_name_);
+    if (!fts) {
+      continue;  // segment has no FTS indexer for this field
+    }
+    auto search_result = fts->Search(query.text_, per_segment_topk, fts_op);
+    if (!search_result.has_value()) {
+      return tl::make_unexpected(search_result.error());
+    }
+    auto res = search_result.value();
+    if (!res || res->count() == 0) {
+      continue;
+    }
+    auto it = res->create_iterator();
+    while (it->valid()) {
+      const auto local_id = static_cast<uint32_t>(it->doc_id());
+      const auto score = it->score();
+      it->next();
+
+      auto g = segment->get_global_doc_id(local_id);
+      if (!g.has_value()) {
+        continue;  // stale local id
+      }
+      const uint64_t global_doc_id = g.value();
+      if (delete_store_->is_deleted(global_doc_id)) {
+        continue;
+      }
+      hits.push_back(GlobalHit{segment, global_doc_id, score});
+    }
+  }
+
+  if (hits.empty()) {
+    return DocPtrList();
+  }
+
+  const std::size_t k = std::min(per_segment_topk, hits.size());
+  std::partial_sort(hits.begin(), hits.begin() + k, hits.end(),
+                    [](const GlobalHit &a, const GlobalHit &b) {
+                      if (a.score != b.score) {
+                        return a.score > b.score;
+                      }
+                      return a.global_doc_id < b.global_doc_id;
+                    });
+  hits.resize(k);
+
+  // Materialize full Doc objects, attach BM25 scores, and (if requested)
+  // narrow to the caller-specified output_fields.
+  DocPtrList results;
+  results.reserve(hits.size());
+  for (const auto &h : hits) {
+    auto doc = h.segment->Fetch(h.global_doc_id);
+    if (!doc) {
+      continue;
+    }
+    doc->set_score(h.score);
+    if (query.output_fields_.has_value()) {
+      const auto &keep = query.output_fields_.value();
+      std::unordered_set<std::string> keep_set(keep.begin(), keep.end());
+      for (const auto &fname : doc->field_names()) {
+        if (keep_set.find(fname) == keep_set.end()) {
+          doc->remove(fname);
+        }
+      }
+    }
+    results.push_back(doc);
+  }
+  return results;
 }
 
 Result<GroupResults> CollectionImpl::GroupByQuery(

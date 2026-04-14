@@ -144,16 +144,19 @@ class IndexType:
       FLAT
 
       INVERT
+
+      FTS
     """
 
     FLAT: typing.ClassVar[IndexType]  # value = <IndexType.FLAT: 4>
+    FTS: typing.ClassVar[IndexType]  # value = <IndexType.FTS: 11>
     HNSW: typing.ClassVar[IndexType]  # value = <IndexType.HNSW: 1>
     INVERT: typing.ClassVar[IndexType]  # value = <IndexType.INVERT: 10>
     IVF: typing.ClassVar[IndexType]  # value = <IndexType.IVF: 3>
     UNDEFINED: typing.ClassVar[IndexType]  # value = <IndexType.UNDEFINED: 0>
     __members__: typing.ClassVar[
         dict[str, IndexType]
-    ]  # value = {'UNDEFINED': <IndexType.UNDEFINED: 0>, 'HNSW': <IndexType.HNSW: 1>, 'IVF': <IndexType.IVF: 3>, 'FLAT': <IndexType.FLAT: 4>, 'INVERT': <IndexType.INVERT: 10>}
+    ]  # value = {'UNDEFINED': <IndexType.UNDEFINED: 0>, 'HNSW': <IndexType.HNSW: 1>, 'IVF': <IndexType.IVF: 3>, 'FLAT': <IndexType.FLAT: 4>, 'INVERT': <IndexType.INVERT: 10>, 'FTS': <IndexType.FTS: 11>}
 
     def __eq__(self, other: typing.Any) -> bool: ...
     def __getstate__(self) -> int: ...

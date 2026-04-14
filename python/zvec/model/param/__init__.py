@@ -18,6 +18,7 @@ from _zvec.param import (
     AlterColumnOption,
     CollectionOption,
     FlatIndexParam,
+    FtsIndexParam,
     HnswIndexParam,
     HnswQueryParam,
     HnswRabitqIndexParam,
@@ -26,6 +27,7 @@ from _zvec.param import (
     InvertIndexParam,
     IVFIndexParam,
     IVFQueryParam,
+    MatchOp,
     OptimizeOption,
 )
 
@@ -34,6 +36,7 @@ __all__ = [
     "AlterColumnOption",
     "CollectionOption",
     "FlatIndexParam",
+    "FtsIndexParam",
     "HnswIndexParam",
     "HnswQueryParam",
     "HnswRabitqIndexParam",
@@ -42,5 +45,6 @@ __all__ = [
     "IVFQueryParam",
     "IndexOption",
     "InvertIndexParam",
+    "MatchOp",
     "OptimizeOption",
 ]

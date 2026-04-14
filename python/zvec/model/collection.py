@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Optional, Union, overload
 
 from _zvec import _Collection
+from _zvec.param import _TextQuery
 
 from ..executor import QueryContext, QueryExecutorFactory
 from ..extension import ReRanker
@@ -34,6 +35,7 @@ from .param import (
     IVFIndexParam,
     OptimizeOption,
 )
+from .param.text_query import TextQuery
 from .param.vector_query import VectorQuery
 from .schema import CollectionSchema, CollectionStats, FieldSchema
 
@@ -359,42 +361,92 @@ class Collection:
         self,
         vectors: Optional[Union[VectorQuery, list[VectorQuery]]] = None,
         *,
+        text: Optional[TextQuery] = None,
         topk: int = 10,
         filter: Optional[str] = None,
         include_vector: bool = False,
         output_fields: Optional[list[str]] = None,
         reranker: Optional[ReRanker] = None,
     ) -> list[Doc]:
-        """Perform vector similarity search with optional filtering and re-ranking.
+        """Perform vector / full-text / hybrid search with optional re-ranking.
 
-        At least one `VectorQuery` must be provided.
+        At least one of ``vectors`` or ``text`` must be provided.
+
+          * Vector-only: pass ``vectors=`` (single VectorQuery or a list).
+          * Text-only:   pass ``text=`` with a TextQuery.
+          * Hybrid:      pass both. A ``reranker`` is required to fuse the two
+            ranked lists. ``RrfReRanker`` is the recommended choice — it
+            ranks-fuses regardless of the underlying score scale, so BM25 and
+            vector-similarity scores combine cleanly.
 
         Args:
-            vectors (Optional[Union[VectorQuery, list[VectorQuery]]], optional):
-                One or more vector queries. Defaults to None.
-            topk (int, optional): Number of nearest neighbors to return.
-                Defaults to 10.
-            filter (Optional[str], optional): Boolean expression to pre-filter candidates.
-                Defaults to None.
-            include_vector (bool, optional): Whether to include vector data in results.
-                Defaults to False.
-            output_fields (Optional[list[str]], optional): Scalar fields to include.
-                If None, all fields are returned. Defaults to None.
-            reranker (Optional[ReRanker], optional): Re-ranker to refine results.
-                Defaults to None.
+            vectors: One or more vector queries.
+            text: A full-text-search query.
+            topk: Number of results to return after any re-ranking. Defaults to 10.
+            filter: Boolean expression to pre-filter candidates (vector path only).
+            include_vector: Whether to include vector data in returned Docs.
+            output_fields: Scalar fields to include in returned Docs. ``None``
+                keeps all fields.
+            reranker: Re-ranker used when ``vectors`` is a multi-query list or
+                when ``vectors`` and ``text`` are both supplied.
 
         Returns:
-            list[Doc]: Top-k matching documents, sorted by relevance score.
+            list[Doc]: Top-k matching documents, sorted by descending relevance.
 
         Examples:
-            >>> from zvec import VectorQuery
+            >>> import zvec
+            >>> # Vector-only
             >>> results = collection.query(
-            ...     vectors=VectorQuery("embedding", vector=[0.1, 0.2]),
+            ...     vectors=zvec.VectorQuery("embedding", vector=[0.1, 0.2]),
             ...     topk=5,
-            ...     filter="category == 'tech'",
-            ...     output_fields=["title", "url"]
+            ... )
+            >>> # Text-only
+            >>> results = collection.query(
+            ...     text=zvec.TextQuery(field_name="body", text="quick fox"),
+            ...     topk=5,
+            ... )
+            >>> # Hybrid (semantic + keyword) fused by RRF
+            >>> results = collection.query(
+            ...     vectors=zvec.VectorQuery("embedding", vector=[0.1, 0.2]),
+            ...     text=zvec.TextQuery(field_name="body", text="quick fox"),
+            ...     topk=10,
+            ...     reranker=zvec.RrfReRanker(topn=10),
             ... )
         """
+        has_vectors = vectors is not None
+        has_text = text is not None
+
+        # Text-only fast path.
+        if has_text and not has_vectors:
+            if output_fields is not None and text.output_fields is None:
+                from dataclasses import replace
+                text = replace(text, output_fields=output_fields)
+            return self.query_text(text)
+
+        # Hybrid: run both and fuse.
+        if has_vectors and has_text:
+            if reranker is None:
+                raise ValueError(
+                    "Hybrid query (vectors + text) requires a reranker. "
+                    "Use zvec.RrfReRanker(topn=...) — it ranks-fuses across "
+                    "BM25 and vector scores without normalization."
+                )
+            ctx = QueryContext(
+                topk=topk,
+                filter=filter,
+                queries=[vectors] if isinstance(vectors, VectorQuery) else vectors,
+                include_vector=include_vector,
+                output_fields=output_fields,
+                reranker=None,  # do not reduce inside the executor; we fuse below
+            )
+            vector_docs = self._querier.execute(ctx, self._obj)
+            text_docs = self.query_text(text)
+            fused = reranker.rerank(
+                {"__vectors__": vector_docs, "__text__": text_docs}
+            )
+            return fused[:topk]
+
+        # Vector-only (or no-args legacy) path: existing executor route.
         ctx = QueryContext(
             topk=topk,
             filter=filter,
@@ -404,3 +456,49 @@ class Collection:
             reranker=reranker,
         )
         return self._querier.execute(ctx, self._obj)
+
+    def query_text(self, query: TextQuery) -> list[Doc]:
+        """Run a full-text-search (BM25) query against an FTS-indexed STRING field.
+
+        Tokenizes ``query.text`` with the same tokenizer the field was indexed
+        with, looks up each unique term's posting list, scores docs with BM25
+        and returns the top ``query.topk`` ranked by descending score. Deleted
+        documents are excluded.
+
+        Args:
+            query (TextQuery): The full-text search query.
+
+        Returns:
+            list[Doc]: Top-K matching documents, sorted by BM25 score descending.
+                Each ``Doc`` has its ``score`` attribute set to the BM25 score.
+
+        Examples:
+            >>> import zvec
+            >>> results = collection.query_text(
+            ...     zvec.TextQuery(
+            ...         field_name="body",
+            ...         text="quick brown fox",
+            ...         topk=10,
+            ...     )
+            ... )
+        """
+        if not isinstance(query, TextQuery):
+            raise TypeError(
+                f"query_text expects a TextQuery, got {type(query).__name__}"
+            )
+        query._validate()
+
+        cpp_query = _TextQuery()
+        cpp_query.field_name = query.field_name
+        cpp_query.text = query.text
+        cpp_query.topk = query.topk
+        cpp_query.op = query.op
+        if query.output_fields is not None:
+            cpp_query.output_fields = query.output_fields
+
+        docs = self._obj.QueryText(cpp_query)
+        return [
+            py_doc
+            for doc in docs
+            if (py_doc := convert_to_py_doc(doc, self.schema)) is not None
+        ]

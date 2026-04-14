@@ -20,6 +20,7 @@ from _zvec.schema import _FieldSchema
 
 from zvec.model.param import (
     FlatIndexParam,
+    FtsIndexParam,
     HnswIndexParam,
     HnswRabitqIndexParam,
     InvertIndexParam,
@@ -92,7 +93,7 @@ class FieldSchema:
         name: str,
         data_type: DataType,
         nullable: bool = False,
-        index_param: Optional[InvertIndexParam] = None,
+        index_param: Optional[Union[InvertIndexParam, FtsIndexParam]] = None,
     ):
         if name is None or not isinstance(name, str):
             raise ValueError(
@@ -141,8 +142,8 @@ class FieldSchema:
         return self._cpp_obj.nullable
 
     @property
-    def index_param(self) -> Optional[InvertIndexParam]:
-        """Optional[InvertIndexParam]: Inverted index configuration, if any."""
+    def index_param(self) -> Optional[Union[InvertIndexParam, FtsIndexParam]]:
+        """Optional[Union[InvertIndexParam, FtsIndexParam]]: Index configuration, if any."""
         return self._cpp_obj.index_param
 
     def __dict__(self) -> dict[str, Any]:

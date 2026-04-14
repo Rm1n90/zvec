@@ -156,6 +156,11 @@ class SegmentImpl : public Segment,
   InvertedColumnIndexer::Ptr get_scalar_indexer(
       const std::string &field_name) const override;
 
+  FtsColumnIndexer::Ptr get_fts_indexer(
+      const std::string &field_name) const override;
+
+  Result<uint64_t> get_global_doc_id(uint32_t local_id) const override;
+
   const IndexFilter::Ptr get_filter() override;
 
   Status create_all_vector_index(
@@ -240,6 +245,10 @@ class SegmentImpl : public Segment,
   // Helper functions for Open()
   Status load_persist_scalar_blocks();
   Status load_scalar_index_blocks(bool create = false);
+
+  Status load_fts_index_blocks(bool create = false);
+
+  Status insert_fts_indexer(Doc &doc);
   Status load_vector_index_blocks();
   Status init_memory_components();
   Status finish_memory_components();
@@ -286,8 +295,6 @@ class SegmentImpl : public Segment,
   Status append_wal(const Doc &doc);
   Status update_version(uint32_t delete_snapshot_path_suffix);
 
-  Result<uint64_t> get_global_doc_id(uint32_t local_id) const;
-
   BlockID allocate_block_id();
 
   bool validate(const std::vector<std::string> &columns) const;
@@ -317,6 +324,9 @@ class SegmentImpl : public Segment,
 
   // scalar index (uses segment-local doc ID)
   InvertedIndexer::Ptr invert_indexers_;
+
+  // full-text-search index (uses segment-local doc ID)
+  FtsIndexer::Ptr fts_indexers_;
 
   // vector index (uses block-local doc ID, each indexer starts from 0)
   std::unordered_map<std::string, VectorColumnIndexer::Ptr>
@@ -443,6 +453,10 @@ Status SegmentImpl::Open(const SegmentOptions &options) {
   s = load_scalar_index_blocks();
   CHECK_RETURN_STATUS(s);
 
+  // load full-text-search indexes
+  s = load_fts_index_blocks();
+  CHECK_RETURN_STATUS(s);
+
   // load vector indexes
   s = load_vector_index_blocks();
   CHECK_RETURN_STATUS(s);
@@ -506,6 +520,9 @@ Status SegmentImpl::Create(const SegmentOptions &options, uint64_t min_doc_id) {
   auto s = load_scalar_index_blocks(true);
   CHECK_RETURN_STATUS(s);
 
+  s = load_fts_index_blocks(true);
+  CHECK_RETURN_STATUS(s);
+
   doc_id_allocator_.store(min_doc_id);
 
   return Status::OK();
@@ -515,6 +532,9 @@ Status SegmentImpl::close() {
   flush();
   if (invert_indexers_) {
     invert_indexers_.reset();
+  }
+  if (fts_indexers_) {
+    fts_indexers_.reset();
   }
   for (const auto &[name, indexers] : vector_indexers_) {
     for (auto indexer : indexers) {
@@ -712,6 +732,36 @@ Status SegmentImpl::insert_scalar_indexer(Doc &doc) {
   return Status::OK();
 }
 
+Status SegmentImpl::insert_fts_indexer(Doc &doc) {
+  if (!fts_indexers_) {
+    return Status::OK();
+  }
+  for (const auto &field : collection_schema_->forward_fields()) {
+    if (field->index_type() != IndexType::FTS) {
+      continue;
+    }
+    auto indexer = (*fts_indexers_)[field->name()];
+    if (!indexer) {
+      return Status::InternalError("FTS indexer missing for field ",
+                                   field->name());
+    }
+    auto segment_doc_id = static_cast<uint32_t>(doc_ids_.size());
+    auto value = doc.get<std::string>(field->name());
+    Status s;
+    if (value.has_value()) {
+      s = indexer->Insert(segment_doc_id, value.value());
+    } else {
+      s = indexer->InsertNull(segment_doc_id);
+    }
+    if (!s.ok()) {
+      LOG_ERROR("insert fts failed for field %s: %s", field->name().c_str(),
+                s.message().c_str());
+      return s;
+    }
+  }
+  return Status::OK();
+}
+
 Status SegmentImpl::insert_vector_indexer(Doc &doc) {
   for (const auto &field : collection_schema_->vector_fields()) {
     std::vector<VectorColumnIndexer::Ptr> indexers;
@@ -811,6 +861,11 @@ Status SegmentImpl::internal_insert(Doc &doc) {
 
   // write scalar index
   s = insert_scalar_indexer(doc);
+  if (!s.ok() && s.code() != StatusCode::ALREADY_EXISTS) {
+    return s;
+  }
+  // write full-text-search index
+  s = insert_fts_indexer(doc);
   if (!s.ok() && s.code() != StatusCode::ALREADY_EXISTS) {
     return s;
   }
@@ -1540,6 +1595,14 @@ InvertedColumnIndexer::Ptr SegmentImpl::get_scalar_indexer(
   return nullptr;
 }
 
+FtsColumnIndexer::Ptr SegmentImpl::get_fts_indexer(
+    const std::string &field_name) const {
+  if (fts_indexers_) {
+    return (*fts_indexers_)[field_name];
+  }
+  return nullptr;
+}
+
 const IndexFilter::Ptr SegmentImpl::get_filter() {
   return delete_store_->empty() ? nullptr : filter_;
 }
@@ -2007,6 +2070,9 @@ Status SegmentImpl::create_scalar_index(const std::vector<std::string> &columns,
     std::vector<FieldSchema> inverted_fields;
     std::vector<std::string> inverted_field_names;
     for (auto field : inverted_fields_ptr) {
+      if (field->index_type() != IndexType::INVERT) {
+        continue;
+      }
       inverted_fields.push_back(*field);
       inverted_field_names.push_back(field->name());
     }
@@ -2191,6 +2257,11 @@ Status SegmentImpl::dump() {
     CHECK_RETURN_STATUS(s);
   }
 
+  if (fts_indexers_) {
+    s = fts_indexers_->seal();
+    CHECK_RETURN_STATUS(s);
+  }
+
   sealed_ = true;
 
   return Status::OK();
@@ -2220,6 +2291,12 @@ Status SegmentImpl::flush() {
   // flush scalar indexer
   if (invert_indexers_) {
     s = invert_indexers_->flush();
+    CHECK_RETURN_STATUS(s);
+  }
+
+  // flush full-text-search indexer
+  if (fts_indexers_) {
+    s = fts_indexers_->flush();
     CHECK_RETURN_STATUS(s);
   }
 
@@ -3041,6 +3118,9 @@ Status SegmentImpl::reopen_invert_indexer(bool read_only) {
   auto inverted_fields_ptr = collection_schema_->forward_fields_with_index();
   std::vector<FieldSchema> inverted_fields;
   for (auto field : inverted_fields_ptr) {
+    if (field->index_type() != IndexType::INVERT) {
+      continue;
+    }
     inverted_fields.push_back(*field);
     inverted_field_names.push_back(field->name());
   }
@@ -3978,6 +4058,60 @@ Status SegmentImpl::load_scalar_index_blocks(bool create) {
     if (invert_indexers_ == nullptr) {
       LOG_ERROR("No scalar index found");
       return Status::NotFound("No scalar index found");
+    }
+  }
+  return Status::OK();
+}
+
+Status SegmentImpl::load_fts_index_blocks(bool create) {
+  std::vector<FieldSchema> fields;
+  std::vector<std::string> field_names;
+  for (const auto &field : collection_schema_->forward_fields()) {
+    if (field->index_type() == IndexType::FTS) {
+      fields.push_back(*field);
+      field_names.push_back(field->name());
+    }
+  }
+
+  if (fields.empty()) {
+    LOG_INFO("No FTS index found");
+    return Status::OK();
+  }
+
+  if (create) {
+    auto block_id = allocate_block_id();
+    auto fts_path = FileHelper::MakeFtsIndexPath(path_, id(), block_id);
+    auto collection_name = collection_schema_->name();
+    fts_indexers_ = FtsIndexer::CreateAndOpen(collection_name, fts_path, true,
+                                              fields, options_.read_only_);
+    if (!fts_indexers_) {
+      LOG_ERROR("Failed to open FTS indexer");
+      return Status::InternalError("Failed to open FTS indexer");
+    }
+
+    segment_meta_->add_persisted_block(
+        BlockMeta{block_id, BlockType::FTS_INDEX, 0, 0, 0, field_names});
+
+    return Status::OK();
+  } else {
+    for (const auto &block : segment_meta_->persisted_blocks()) {
+      if (block.type() == BlockType::FTS_INDEX) {
+        auto block_id = block.id();
+        auto fts_path = FileHelper::MakeFtsIndexPath(path_, id(), block_id);
+        auto collection_name = collection_schema_->name();
+        fts_indexers_ = FtsIndexer::CreateAndOpen(
+            collection_name, fts_path, false, fields, options_.read_only_);
+        if (!fts_indexers_) {
+          LOG_ERROR("Failed to open FTS indexer");
+          return Status::InternalError("Failed to open FTS indexer");
+        }
+        return Status::OK();
+      }
+    }
+
+    if (fts_indexers_ == nullptr) {
+      LOG_ERROR("No FTS index block found for declared FTS fields");
+      return Status::NotFound("No FTS index block found");
     }
   }
   return Status::OK();

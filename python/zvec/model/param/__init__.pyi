@@ -14,6 +14,7 @@ __all__: list[str] = [
     "AlterColumnOption",
     "CollectionOption",
     "FlatIndexParam",
+    "FtsIndexParam",
     "HnswIndexParam",
     "HnswQueryParam",
     "HnswRabitqIndexParam",
@@ -23,6 +24,7 @@ __all__: list[str] = [
     "IndexOption",
     "IndexParam",
     "InvertIndexParam",
+    "MatchOp",
     "OptimizeOption",
     "QueryParam",
     "SegmentOption",
@@ -176,6 +178,68 @@ class FlatIndexParam(VectorIndexParam):
     def to_dict(self) -> dict:
         """
         Convert to dictionary with all fields
+        """
+
+class FtsIndexParam(IndexParam):
+    """
+
+    Parameters for configuring a full-text-search (BM25) index.
+
+    This index lets a STRING field be searched with tokenized text queries
+    ranked by BM25. The same tokenizer is used at index time and at query
+    time, so both sides agree on the vocabulary.
+
+    Attributes:
+        type (IndexType): Always ``IndexType.FTS``.
+        tokenizer (str): Tokenizer name (currently only ``"default"``).
+        k1 (float): BM25 term-frequency saturation parameter (default 1.2).
+        b (float): BM25 length-normalization parameter in [0, 1] (default 0.75).
+
+    Examples:
+        >>> params = FtsIndexParam(tokenizer="default", k1=1.2, b=0.75)
+        >>> print(params.tokenizer)
+        default
+    """
+
+    def __getstate__(self) -> tuple: ...
+    def __init__(
+        self,
+        tokenizer: str = "default",
+        k1: typing.SupportsFloat = 1.2,
+        b: typing.SupportsFloat = 0.75,
+    ) -> None:
+        """
+        Construct an FtsIndexParam.
+
+        Args:
+            tokenizer (str, optional): Tokenizer name. Defaults to ``"default"``.
+            k1 (float, optional): BM25 ``k1`` parameter. Defaults to 1.2.
+            b (float, optional): BM25 ``b`` parameter in [0, 1]. Defaults to 0.75.
+        """
+
+    def __repr__(self) -> str: ...
+    def __setstate__(self, arg0: tuple) -> None: ...
+    def to_dict(self) -> dict:
+        """
+        Convert to dictionary with all fields
+        """
+
+    @property
+    def tokenizer(self) -> str:
+        """
+        str: Tokenizer name.
+        """
+
+    @property
+    def k1(self) -> float:
+        """
+        float: BM25 k1 (term-frequency saturation).
+        """
+
+    @property
+    def b(self) -> float:
+        """
+        float: BM25 b (length normalization).
         """
 
 class HnswIndexParam(VectorIndexParam):
@@ -654,6 +718,48 @@ class InvertIndexParam(IndexParam):
         bool: Whether range optimization is enabled for this inverted index.
         """
 
+class MatchOp:
+    """
+
+    Combinator applied across query terms in a TextQuery.
+
+    - OR: a doc matches if it contains any term; per-term BM25 scores are summed.
+    - AND: a doc must contain every query term to match.
+
+    Examples:
+        >>> from zvec import MatchOp
+        >>> MatchOp.OR
+        <MatchOp.OR: 0>
+
+
+    Members:
+
+      OR
+
+      AND
+    """
+
+    AND: typing.ClassVar[MatchOp]  # value = <MatchOp.AND: 1>
+    OR: typing.ClassVar[MatchOp]  # value = <MatchOp.OR: 0>
+    __members__: typing.ClassVar[
+        dict[str, MatchOp]
+    ]  # value = {'OR': <MatchOp.OR: 0>, 'AND': <MatchOp.AND: 1>}
+
+    def __eq__(self, other: typing.Any) -> bool: ...
+    def __getstate__(self) -> int: ...
+    def __hash__(self) -> int: ...
+    def __index__(self) -> int: ...
+    def __init__(self, value: typing.SupportsInt) -> None: ...
+    def __int__(self) -> int: ...
+    def __ne__(self, other: typing.Any) -> bool: ...
+    def __repr__(self) -> str: ...
+    def __setstate__(self, state: typing.SupportsInt) -> None: ...
+    def __str__(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
 class OptimizeOption:
     """
 
@@ -821,3 +927,21 @@ class _VectorQuery:
     def topk(self) -> int: ...
     @topk.setter
     def topk(self, arg0: typing.SupportsInt) -> None: ...
+
+class _TextQuery:
+    """
+    Internal C++ representation of a TextQuery. Use ``zvec.TextQuery`` instead.
+    """
+
+    field_name: str
+    text: str
+    op: MatchOp
+    topk: int
+
+    def __getstate__(self) -> tuple: ...
+    def __init__(self) -> None: ...
+    def __setstate__(self, arg0: tuple) -> None: ...
+    @property
+    def output_fields(self) -> list[str] | None: ...
+    @output_fields.setter
+    def output_fields(self, arg0: collections.abc.Sequence[str] | None) -> None: ...

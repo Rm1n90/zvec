@@ -25,6 +25,8 @@
 #include <zvec/db/options.h>
 #include <zvec/db/schema.h>
 #include <zvec/db/status.h>
+#include "db/index/column/fts_column/fts_column_indexer.h"
+#include "db/index/column/fts_column/fts_indexer.h"
 #include "db/index/column/inverted_column/inverted_column_indexer.h"
 #include "db/index/column/inverted_column/inverted_indexer.h"
 #include "db/index/column/vector_column/combined_vector_column_indexer.h"
@@ -168,6 +170,15 @@ class Segment {
   // caller hold segment shared_ptr for segment handle the indexer's lifetime
   virtual InvertedColumnIndexer::Ptr get_scalar_indexer(
       const std::string &field_name) const = 0;
+
+  // caller hold segment shared_ptr for segment handle the indexer's lifetime
+  virtual FtsColumnIndexer::Ptr get_fts_indexer(
+      const std::string &field_name) const = 0;
+
+  // Translate a segment-local index (e.g. one returned by an FTS search) to
+  // its global doc id. Returns an InvalidArgument status if @p local_id is
+  // out of range.
+  virtual Result<uint64_t> get_global_doc_id(uint32_t local_id) const = 0;
 
   virtual const IndexFilter::Ptr get_filter() = 0;
 

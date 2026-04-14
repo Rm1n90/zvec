@@ -32,6 +32,7 @@ class ZVecPyParams {
   static void bind_query_params(py::module_ &m);
   static void bind_options(py::module_ &m);
   static void bind_vector_query(py::module_ &m);
+  static void bind_text_query(py::module_ &m);
 };
 
 }  // namespace zvec

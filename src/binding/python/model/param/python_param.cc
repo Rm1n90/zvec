@@ -25,6 +25,8 @@ static std::string index_type_to_string(const IndexType type) {
   switch (type) {
     case IndexType::INVERT:
       return "INVERT";
+    case IndexType::FTS:
+      return "FTS";
     case IndexType::FLAT:
       return "FLAT";
     case IndexType::IVF:
@@ -127,6 +129,9 @@ void ZVecPyParams::Initialize(pybind11::module_ &parent) {
 
   // bind vector query
   bind_vector_query(m);
+
+  // bind FTS text query + MatchOp enum
+  bind_text_query(m);
 }
 
 void ZVecPyParams::bind_index_params(pybind11::module_ &m) {
@@ -247,6 +252,74 @@ Note: Prefix search is always enabled regardless of this setting.
               throw std::runtime_error("Invalid state for InvertIndexParams");
             return std::make_shared<InvertIndexParams>(t[0].cast<bool>(),
                                                        t[1].cast<bool>());
+          }));
+
+  // binding FTS (full-text-search) index params
+  py::class_<FtsIndexParams, IndexParams, std::shared_ptr<FtsIndexParams>>
+      fts_params(m, "FtsIndexParam", R"pbdoc(
+Parameters for configuring a full-text-search (BM25) index.
+
+This index lets a STRING field be searched with tokenized text queries
+ranked by BM25. The same tokenizer is used at index time and at query
+time, so both sides agree on the vocabulary.
+
+Attributes:
+    type (IndexType): Always ``IndexType.FTS``.
+    tokenizer (str): Tokenizer name (currently only ``"default"``).
+    k1 (float): BM25 term-frequency saturation parameter (default 1.2).
+    b (float): BM25 length-normalization parameter in [0, 1] (default 0.75).
+
+Examples:
+    >>> params = FtsIndexParam(tokenizer="default", k1=1.2, b=0.75)
+    >>> print(params.tokenizer)
+    default
+    >>> print(params.k1)
+    1.2
+)pbdoc");
+  fts_params
+      .def(py::init<std::string, float, float>(),
+           py::arg("tokenizer") = "default", py::arg("k1") = 1.2f,
+           py::arg("b") = 0.75f,
+           R"pbdoc(
+Construct an FtsIndexParam.
+
+Args:
+    tokenizer (str, optional): Tokenizer name. Defaults to ``"default"``.
+    k1 (float, optional): BM25 ``k1`` parameter. Defaults to 1.2.
+    b (float, optional): BM25 ``b`` parameter in [0, 1]. Defaults to 0.75.
+)pbdoc")
+      .def_property_readonly("tokenizer", &FtsIndexParams::tokenizer,
+                             "str: Tokenizer name.")
+      .def_property_readonly("k1", &FtsIndexParams::k1,
+                             "float: BM25 k1 (term-frequency saturation).")
+      .def_property_readonly("b", &FtsIndexParams::b,
+                             "float: BM25 b (length normalization).")
+      .def(
+          "to_dict",
+          [](const FtsIndexParams &self) -> py::dict {
+            py::dict dict;
+            dict["tokenizer"] = self.tokenizer();
+            dict["k1"] = self.k1();
+            dict["b"] = self.b();
+            return dict;
+          },
+          "Convert to dictionary with all fields")
+      .def("__repr__",
+           [](const FtsIndexParams &self) -> std::string {
+             return "{\"tokenizer\":\"" + self.tokenizer() +
+                    "\",\"k1\":" + std::to_string(self.k1()) +
+                    ",\"b\":" + std::to_string(self.b()) + "}";
+           })
+      .def(py::pickle(
+          [](const FtsIndexParams &self) {  // __getstate__
+            return py::make_tuple(self.tokenizer(), self.k1(), self.b());
+          },
+          [](py::tuple t) {  // __setstate__
+            if (t.size() != 3)
+              throw std::runtime_error("Invalid state for FtsIndexParams");
+            return std::make_shared<FtsIndexParams>(t[0].cast<std::string>(),
+                                                    t[1].cast<float>(),
+                                                    t[2].cast<float>());
           }));
 
   // binding base vector index params
@@ -1393,4 +1466,48 @@ void ZVecPyParams::bind_vector_query(py::module_ &m) {
             return obj;
           }));
 }
+
+void ZVecPyParams::bind_text_query(py::module_ &m) {
+  // Bind the MatchOp enum first so _TextQuery.op can use it.
+  py::enum_<TextQuery::MatchOp>(m, "MatchOp", R"pbdoc(
+Combinator applied across query terms in a TextQuery.
+
+- OR: a doc matches if it contains any term; per-term BM25 scores are summed.
+- AND: a doc must contain every query term to match.
+
+Examples:
+    >>> from zvec import MatchOp
+    >>> MatchOp.OR
+    <MatchOp.OR: 0>
+)pbdoc")
+      .value("OR", TextQuery::MatchOp::OR)
+      .value("AND", TextQuery::MatchOp::AND);
+
+  py::class_<TextQuery>(m, "_TextQuery")
+      .def(py::init<>())
+      .def_readwrite("topk", &TextQuery::topk_)
+      .def_readwrite("field_name", &TextQuery::field_name_)
+      .def_readwrite("text", &TextQuery::text_)
+      .def_readwrite("op", &TextQuery::op_)
+      .def_readwrite("output_fields", &TextQuery::output_fields_)
+      .def(py::pickle(
+          [](const TextQuery &self) {
+            return py::make_tuple(self.topk_, self.field_name_, self.text_,
+                                  static_cast<uint32_t>(self.op_),
+                                  self.output_fields_);
+          },
+          [](py::tuple t) {
+            if (t.size() != 5)
+              throw std::runtime_error("Invalid pickle data for TextQuery");
+            TextQuery q{};
+            q.topk_ = t[0].cast<int>();
+            q.field_name_ = t[1].cast<std::string>();
+            q.text_ = t[2].cast<std::string>();
+            q.op_ = static_cast<TextQuery::MatchOp>(t[3].cast<uint32_t>());
+            q.output_fields_ =
+                t[4].cast<std::optional<std::vector<std::string>>>();
+            return q;
+          }));
+}
+
 }  // namespace zvec

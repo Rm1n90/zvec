@@ -111,6 +111,61 @@ class InvertIndexParams : public IndexParams {
 };
 
 /*
+ * Scalar: Full-text-search index params
+ */
+class FtsIndexParams : public IndexParams {
+ public:
+  using OPtr = std::shared_ptr<FtsIndexParams>;
+
+  FtsIndexParams(std::string tokenizer = "default", float k1 = 1.2f,
+                 float b = 0.75f)
+      : IndexParams(IndexType::FTS),
+        tokenizer_(std::move(tokenizer)),
+        k1_(k1),
+        b_(b) {}
+
+  Ptr clone() const override {
+    return std::make_shared<FtsIndexParams>(tokenizer_, k1_, b_);
+  }
+
+  std::string to_string() const override;
+
+  bool operator==(const IndexParams &other) const override {
+    if (type() != other.type()) {
+      return false;
+    }
+    auto &o = dynamic_cast<const FtsIndexParams &>(other);
+    return tokenizer_ == o.tokenizer_ && k1_ == o.k1_ && b_ == o.b_;
+  }
+
+  const std::string &tokenizer() const {
+    return tokenizer_;
+  }
+  void set_tokenizer(const std::string &tokenizer) {
+    tokenizer_ = tokenizer;
+  }
+
+  float k1() const {
+    return k1_;
+  }
+  void set_k1(float k1) {
+    k1_ = k1;
+  }
+
+  float b() const {
+    return b_;
+  }
+  void set_b(float b) {
+    b_ = b;
+  }
+
+ private:
+  std::string tokenizer_;
+  float k1_;
+  float b_;
+};
+
+/*
  * Column index params
  */
 class VectorIndexParams : public IndexParams {

@@ -61,6 +61,7 @@ from .model.param import (
     AlterColumnOption,
     CollectionOption,
     FlatIndexParam,
+    FtsIndexParam,
     HnswIndexParam,
     HnswQueryParam,
     HnswRabitqIndexParam,
@@ -69,8 +70,10 @@ from .model.param import (
     InvertIndexParam,
     IVFIndexParam,
     IVFQueryParam,
+    MatchOp,
     OptimizeOption,
 )
+from .model.param.text_query import TextQuery
 from .model.param.vector_query import VectorQuery
 
 # —— Schema & field definitions ——
@@ -109,7 +112,10 @@ __all__ = [
     "CollectionStats",
     # Parameters
     "VectorQuery",
+    "TextQuery",
+    "MatchOp",
     "InvertIndexParam",
+    "FtsIndexParam",
     "HnswIndexParam",
     "HnswRabitqIndexParam",
     "FlatIndexParam",
