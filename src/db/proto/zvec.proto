@@ -60,6 +60,8 @@ enum IndexType {
   IT_HNSW_RABITQ = 4;
   // Invert Index
   IT_INVERT = 10;
+  // Full-text search index
+  IT_FTS = 11;
 };
 
 enum QuantizeType {
@@ -142,6 +144,7 @@ enum BlockType {
   BT_SCALAR_INDEX = 2;
   BT_VECTOR_INDEX = 3;
   BT_VECTOR_INDEX_QUANTIZE = 4;
+  BT_FTS_INDEX = 5;
 };
 
 message BlockMeta {

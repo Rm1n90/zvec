@@ -381,6 +381,34 @@ struct VectorQuery {
   Status validate(const FieldSchema *schema) const;
 };
 
+/**
+ * @brief Full-text-search query.
+ *
+ * Resolved against a STRING field that has an FTS index. Tokenized at
+ * query time using the same tokenizer the field was indexed with; a doc
+ * matches when @c op semantics hold over the resulting term set.
+ *
+ * @c topk_ controls how many docs are returned (sorted by descending BM25
+ * score). When the collection has multiple segments, top-K is computed
+ * globally (segment-local top-Ks are merged).
+ */
+struct TextQuery {
+  enum class MatchOp : uint32_t {
+    OR = 0,   ///< default: any term matches; per-term scores summed
+    AND = 1,  ///< doc must contain every query term
+  };
+
+  int topk_{10};
+  std::string field_name_;
+  std::string text_;
+  MatchOp op_{MatchOp::OR};
+  // select * by default, no field if output_fields_ is empty,
+  // specific fields if output_fields_ is non-empty
+  std::optional<std::vector<std::string>> output_fields_;
+
+  Status validate(const FieldSchema *schema) const;
+};
+
 struct GroupByVectorQuery {
   std::string field_name_;
   std::string query_vector_;

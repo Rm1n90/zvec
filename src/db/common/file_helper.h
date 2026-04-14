@@ -138,6 +138,20 @@ class FileHelper {
                                         ".rocksdb");
   }
 
+  // e.g.: **/seg1/fts.index.1.rocksdb
+  static const std::string MakeFtsIndexPath(const std::string &path,
+                                            uint32_t seg_id,
+                                            uint32_t block_id) {
+    return ailego::StringHelper::Concat(path, "/", seg_id, "/fts.index.",
+                                        block_id, ".rocksdb");
+  }
+
+  static const std::string MakeFtsIndexPath(const std::string &seg_path,
+                                            uint32_t block_id) {
+    return ailego::StringHelper::Concat(seg_path, "/fts.index.", block_id,
+                                        ".rocksdb");
+  }
+
   static const std::string MakeVectorIndexPath(const std::string &path,
                                                const std::string &column,
                                                uint32_t seg_id,

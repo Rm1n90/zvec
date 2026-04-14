@@ -28,6 +28,13 @@ std::string InvertIndexParams::to_string() const {
   return oss.str();
 }
 
+std::string FtsIndexParams::to_string() const {
+  std::ostringstream oss;
+  oss << "FtsIndexParams{tokenizer:" << tokenizer_ << ", k1:" << k1_
+      << ", b:" << b_ << "}";
+  return oss.str();
+}
+
 std::string VectorIndexParams::vector_index_params_to_string(
     const std::string &class_name, MetricType metric_type,
     QuantizeType quantize_type) const {

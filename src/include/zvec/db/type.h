@@ -27,6 +27,7 @@ enum class IndexType : uint32_t {
   FLAT = 3,
   HNSW_RABITQ = 4,
   INVERT = 10,
+  FTS = 11,
 };
 
 /*
@@ -123,6 +124,7 @@ enum BlockType : uint32_t {
   SCALAR_INDEX = 2,
   VECTOR_INDEX = 3,
   VECTOR_INDEX_QUANTIZE = 4,
+  FTS_INDEX = 5,
 };
 
 

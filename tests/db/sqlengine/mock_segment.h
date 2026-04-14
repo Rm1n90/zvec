@@ -374,6 +374,15 @@ class MockSegment : public Segment {
     return std::make_shared<MockInvertIndexer>();
   }
 
+  FtsColumnIndexer::Ptr get_fts_indexer(
+      const std::string &field_name) const override {
+    return nullptr;
+  }
+
+  Result<uint64_t> get_global_doc_id(uint32_t local_id) const override {
+    return tl::make_unexpected(Status::NotSupported("MockSegment"));
+  }
+
   SegmentMeta::Ptr meta() const override {
     return nullptr;
   }

@@ -200,6 +200,12 @@ void ZVecPyCollection::bind_dql_methods(
             // return DocPtrList
             return unwrap_expected(result);
           })
+      .def("QueryText",
+           [](const Collection &self, const TextQuery &query) {
+             const auto result = self.QueryText(query);
+             // return DocPtrList
+             return unwrap_expected(result);
+           })
       .def("GroupByQuery",
            [](const Collection &self, const GroupByVectorQuery &query) {
              const auto result = self.GroupByQuery(query);

@@ -1277,4 +1277,37 @@ Status VectorQuery::validate(const FieldSchema *schema) const {
   return Status::OK();
 }
 
+Status TextQuery::validate(const FieldSchema *schema) const {
+  if (topk_ < 0 || static_cast<uint32_t>(topk_) > kMaxQueryTopk) {
+    return Status::InvalidArgument("text query validate failed: topk[", topk_,
+                                   "] out of range, max is ", kMaxQueryTopk);
+  }
+  if (output_fields_.has_value() &&
+      output_fields_->size() > kMaxOutputFieldSize) {
+    return Status::InvalidArgument(
+        "text query validate failed: output_fields too large, max is ",
+        kMaxOutputFieldSize);
+  }
+  if (field_name_.empty()) {
+    return Status::InvalidArgument(
+        "text query validate failed: field_name is empty");
+  }
+  if (schema == nullptr) {
+    return Status::InvalidArgument(
+        "text query validate failed: field[", field_name_,
+        "] not defined in the collection schema");
+  }
+  if (schema->index_type() != IndexType::FTS) {
+    return Status::InvalidArgument(
+        "text query validate failed: field[", field_name_,
+        "] is not declared with an FTS index");
+  }
+  if (schema->data_type() != DataType::STRING) {
+    return Status::InvalidArgument(
+        "text query validate failed: field[", field_name_,
+        "] must be of STRING data type");
+  }
+  return Status::OK();
+}
+
 }  // namespace zvec

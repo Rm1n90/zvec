@@ -17,6 +17,7 @@ from .model.param import (
     AlterColumnOption,
     CollectionOption,
     FlatIndexParam,
+    FtsIndexParam,
     HnswIndexParam,
     HnswQueryParam,
     HnswRabitqIndexParam,
@@ -25,8 +26,10 @@ from .model.param import (
     InvertIndexParam,
     IVFIndexParam,
     IVFQueryParam,
+    MatchOp,
     OptimizeOption,
 )
+from .model.param.text_query import TextQuery
 from .model.param.vector_query import VectorQuery
 from .model.schema import CollectionSchema, CollectionStats, FieldSchema, VectorSchema
 from .tool import require_module
@@ -54,6 +57,7 @@ __all__: list = [
     "Doc",
     "FieldSchema",
     "FlatIndexParam",
+    "FtsIndexParam",
     "HnswIndexParam",
     "HnswQueryParam",
     "HnswRabitqIndexParam",
@@ -65,6 +69,7 @@ __all__: list = [
     "InvertIndexParam",
     "LogLevel",
     "LogType",
+    "MatchOp",
     "MetricType",
     "OptimizeOption",
     "QuantizeType",
@@ -73,6 +78,7 @@ __all__: list = [
     "RrfReRanker",
     "Status",
     "StatusCode",
+    "TextQuery",
     "VectorQuery",
     "VectorSchema",
     "WeightedReRanker",
@@ -118,6 +124,7 @@ class _Collection:
     def Options(self) -> param.CollectionOption: ...
     def Path(self) -> str: ...
     def Query(self, arg0: param._VectorQuery) -> list[_Doc]: ...
+    def QueryText(self, arg0: param._TextQuery) -> list[_Doc]: ...
     def Schema(self) -> schema._CollectionSchema: ...
     def Stats(self) -> schema.CollectionStats: ...
     def Update(self, arg0: collections.abc.Sequence[_Doc]) -> list[typing.Status]: ...
