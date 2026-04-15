@@ -39,6 +39,7 @@
 #include <zvec/db/status.h>
 #include "db/common/constants.h"
 #include "db/common/file_helper.h"
+#include "db/common/pk_shard.h"
 #include "db/common/profiler.h"
 #include "db/common/typedef.h"
 #include "db/index/common/delete_store.h"
@@ -160,6 +161,41 @@ class CollectionImpl : public Collection {
   std::vector<Segment::Ptr> get_all_segments() const;
 
   std::vector<Segment::Ptr> get_all_persist_segments() const;
+
+  // === Phase 4 — read-side shard abstraction ==============================
+  // These accessors let query / DDL / iteration sites treat the
+  // writing-segment layer as a logical fan-out over N_shards shards.
+  // Phase 4 hardcodes N_shards = 1, so they behave as if the collection
+  // has exactly one writing segment — matching the pre-Phase-4
+  // behaviour exactly. Phase 5 will swap the body of these accessors
+  // to a real per-shard writing_segments_ vector without touching any
+  // of the call sites.
+  static constexpr size_t kPhase4ShardCount = 1;
+
+  size_t n_shards() const { return kPhase4ShardCount; }
+
+  size_t shard_of_pk(const std::string &pk) const {
+    return PkToShard(pk, n_shards());
+  }
+
+  // Returns the writing segment that owns `shard`. Phase 4: only shard
+  // 0 is valid.
+  Segment::Ptr writing_segment_of_shard(size_t shard) const {
+    (void)shard;  // assert once Phase 5 lands; for now shard must be 0
+    return writing_segment_;
+  }
+
+  // Returns the writing segment a given pk routes to. Phase 5 will make
+  // this non-degenerate.
+  Segment::Ptr writing_segment_for_pk(const std::string &pk) const {
+    return writing_segment_of_shard(shard_of_pk(pk));
+  }
+
+  // Enumerate every writing segment across every shard. Phase 4 always
+  // returns a one-element vector.
+  std::vector<Segment::Ptr> all_writing_segments() const {
+    return {writing_segment_};
+  }
 
   Segment::Ptr local_segment_by_doc_id(
       uint64_t doc_id, const std::vector<Segment::Ptr> &segments) const;
@@ -2270,9 +2306,15 @@ Segment::Ptr CollectionImpl::local_segment_by_doc_id(
 }
 
 std::vector<Segment::Ptr> CollectionImpl::get_all_segments() const {
+  // Persisted segments first, then every non-empty writing shard. The
+  // loop is trivially one iteration under Phase 4 (N_shards = 1) but
+  // is the Phase-5 fan-out point — enumerating every shard's writing
+  // segment will "just work" once all_writing_segments() grows.
   std::vector<Segment::Ptr> segments = get_all_persist_segments();
-  if (writing_segment_->doc_count() > 0) {
-    segments.push_back(writing_segment_);
+  for (const auto &ws : all_writing_segments()) {
+    if (ws && ws->doc_count() > 0) {
+      segments.push_back(ws);
+    }
   }
   return segments;
 }
