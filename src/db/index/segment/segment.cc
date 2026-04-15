@@ -299,6 +299,21 @@ class SegmentImpl : public Segment,
   Status internal_upsert(Doc &doc);
   Status internal_delete(const Doc &doc);
 
+  // Phase 3: batched internal write pipeline. Assumes caller holds
+  // seg_mtx_. Assigns a contiguous doc_id range via one fetch_add(N),
+  // serialises all WAL records in one append_batch, commits one
+  // RocksDB WriteBatch to id_map_, inserts one batch into memory_store_,
+  // then runs per-doc scalar/fts/vector indexer inserts and updates
+  // mem_block metadata. `olds_to_delete` is the list of existing doc
+  // ids that should be tombstoned first (Upsert/Update); pass empty for
+  // plain Insert. `ok_indices` maps the j-th write in `all_docs` back to
+  // its original input index so per-doc errors land in the right slot
+  // of `results_out`.
+  Status apply_batched_writes(std::vector<Doc> &all_docs,
+                              const std::vector<size_t> &ok_indices,
+                              const std::vector<uint64_t> &olds_to_delete,
+                              WriteResults &results_out);
+
   Status recover();
   Status open_wal_file();
   Status append_wal(const Doc &doc);
@@ -1002,41 +1017,160 @@ Status SegmentImpl::Delete(uint64_t g_doc_id) {
 }
 
 // ===========================================================================
-// Batched write path — Phase 2 of the optimization pipeline.
+// Batched write path — Phases 2 + 3 of the optimization pipeline.
 //
-// These methods take seg_mtx_ once for the whole batch, interleave
-// per-doc append_wal (which writes to the OS page cache under
-// PER_BATCH and NONE, or fsyncs per-doc under PER_DOC) with per-doc
-// internal state changes, then issue a single group-commit fsync at the
-// end when the durability mode is PER_BATCH. The per-doc ordering of
-// "WAL record written before internal state change" is preserved so
-// crash recovery remains correct.
+// Phase 2 made these methods take seg_mtx_ once and group-commit the WAL
+// fsync at batch end. Phase 3 pushes the batching deeper: one
+// fetch_add(N) for the whole doc_id range, one `append_batch` WAL write,
+// one RocksDB WriteBatch on id_map_, one mutex-held insert into
+// memory_store_, and per-doc indexer inserts with per-doc error
+// isolation. Pre-validation uses multi_get instead of N individual
+// Gets. Crash-recovery ordering is preserved: WAL records are written
+// before any state mutation in id_map_ / memory_store_ / indexers.
 // ===========================================================================
+
+Status SegmentImpl::apply_batched_writes(
+    std::vector<Doc> &all_docs, const std::vector<size_t> &ok_indices,
+    const std::vector<uint64_t> &olds_to_delete, WriteResults &results_out) {
+  // Mark existing doc_ids tombstoned first (Upsert/Update paths pass
+  // these; Insert passes an empty vector). Matches the per-doc
+  // internal_upsert / internal_update ordering.
+  for (auto old_id : olds_to_delete) {
+    delete_store_->mark_deleted(old_id);
+  }
+
+  if (ok_indices.empty()) return Status::OK();
+
+  // Match per-doc internal_insert semantics: trigger a block dump if the
+  // memory buffer is already full, then lazy-init memory_store.
+  if (ready_for_dump_block()) {
+    auto s = flush();
+    CHECK_RETURN_STATUS(s);
+  }
+  if (!memory_store_) {
+    auto s = init_memory_components();
+    CHECK_RETURN_STATUS(s);
+  }
+
+  // Allocate a contiguous doc_id range in one atomic fetch_add.
+  const size_t N = ok_indices.size();
+  const uint64_t base_doc_id =
+      doc_id_allocator_.fetch_add(static_cast<uint64_t>(N));
+  for (size_t j = 0; j < N; ++j) {
+    all_docs[ok_indices[j]].set_doc_id(base_doc_id + j);
+  }
+
+  // One WAL append_batch call for the whole batch; fsync is still
+  // driven by the Phase-2 durability policy at the call site, not here.
+  {
+    std::vector<std::string> wal_records;
+    wal_records.reserve(N);
+    for (size_t j = 0; j < N; ++j) {
+      auto buf = all_docs[ok_indices[j]].serialize();
+      wal_records.emplace_back(buf.begin(), buf.end());
+    }
+    if (!wal_file_) {
+      auto s = open_wal_file();
+      CHECK_RETURN_STATUS(s);
+    }
+    if (wal_file_->append_batch(std::move(wal_records)) != 0) {
+      return Status::InternalError("WAL append_batch failed");
+    }
+  }
+
+  // One RocksDB WriteBatch for the id_map upserts.
+  {
+    std::vector<std::string> pks(N);
+    std::vector<uint64_t> ids(N);
+    for (size_t j = 0; j < N; ++j) {
+      pks[j] = all_docs[ok_indices[j]].pk();
+      ids[j] = all_docs[ok_indices[j]].doc_id();
+    }
+    auto s = id_map_->upsert_batch(pks, ids);
+    CHECK_RETURN_STATUS(s);
+  }
+
+  // One lock-held insert into memory_store_'s cache. A single
+  // copy-into-a-local-vector step is unavoidable because the underlying
+  // cache_.emplace_back path wants Doc values.
+  {
+    std::vector<Doc> ok_docs;
+    ok_docs.reserve(N);
+    for (size_t j = 0; j < N; ++j) {
+      ok_docs.push_back(all_docs[ok_indices[j]]);
+    }
+    auto s = memory_store_->insert_batch(ok_docs);
+    CHECK_RETURN_STATUS(s);
+  }
+
+  // Per-doc: scalar / fts / vector indexer inserts + mem_block metadata
+  // update + doc_ids_ tracking. Indexer error handling matches
+  // internal_insert — ALREADY_EXISTS is not fatal, other errors land in
+  // results_out at the input index and skip the mem_block update for
+  // that doc.
+  auto &mem_block = segment_meta_->writing_forward_block().value();
+  for (size_t j = 0; j < N; ++j) {
+    auto &doc = all_docs[ok_indices[j]];
+
+    Status idx_s = insert_scalar_indexer(doc);
+    if (!idx_s.ok() && idx_s.code() != StatusCode::ALREADY_EXISTS) {
+      results_out[ok_indices[j]] = idx_s;
+      continue;
+    }
+    idx_s = insert_fts_indexer(doc);
+    if (!idx_s.ok() && idx_s.code() != StatusCode::ALREADY_EXISTS) {
+      results_out[ok_indices[j]] = idx_s;
+      continue;
+    }
+    idx_s = insert_vector_indexer(doc);
+    if (!idx_s.ok() && idx_s != Status::AlreadyExists()) {
+      results_out[ok_indices[j]] = idx_s;
+      continue;
+    }
+
+    mem_block.max_doc_id_ = doc.doc_id();
+    mem_block.doc_count_ = mem_block.doc_count_ + 1;
+    doc_ids_.push_back(doc.doc_id());
+  }
+
+  return Status::OK();
+}
 
 Result<WriteResults> SegmentImpl::InsertBatch(std::vector<Doc> &docs) {
   std::lock_guard lock(seg_mtx_);
 
-  WriteResults results;
-  results.reserve(docs.size());
+  WriteResults results(docs.size());
+  if (docs.empty()) return results;
 
-  for (auto &doc : docs) {
-    if (id_map_ && id_map_->has(doc.pk())) {
-      results.push_back(Status::AlreadyExists("insert failed: doc_id[",
-                                              doc.pk(),
-                                              "] already exists in collection"));
-      continue;
-    }
+  // Pre-validate: one multi_get looks up all pks; existing pks become
+  // per-doc AlreadyExists errors and are excluded from the write
+  // pipeline.
+  std::vector<std::string> pks;
+  pks.reserve(docs.size());
+  for (auto &doc : docs) pks.push_back(doc.pk());
 
-    doc.set_operator(Operator::INSERT);
-
-    auto s = append_wal(doc);
-    if (!s.ok()) {
-      results.push_back(s);
-      continue;
-    }
-
-    results.push_back(internal_insert(doc));
+  std::vector<uint64_t> existing_ids;
+  if (id_map_) {
+    auto s = id_map_->multi_get(pks, &existing_ids);
+    if (!s.ok()) return tl::make_unexpected(s);
   }
+
+  std::vector<size_t> ok_indices;
+  ok_indices.reserve(docs.size());
+  for (size_t i = 0; i < docs.size(); ++i) {
+    if (!existing_ids.empty() && existing_ids[i] != INVALID_DOC_ID) {
+      results[i] =
+          Status::AlreadyExists("insert failed: doc_id[", docs[i].pk(),
+                                "] already exists in collection");
+      continue;
+    }
+    docs[i].set_operator(Operator::INSERT);
+    ok_indices.push_back(i);
+  }
+
+  auto s = apply_batched_writes(docs, ok_indices, /*olds_to_delete=*/{},
+                                results);
+  if (!s.ok()) return tl::make_unexpected(s);
 
   if (options_.wal_durability_ == WalDurability::PER_BATCH && wal_file_) {
     if (wal_file_->flush() != 0) {
@@ -1051,20 +1185,36 @@ Result<WriteResults> SegmentImpl::InsertBatch(std::vector<Doc> &docs) {
 Result<WriteResults> SegmentImpl::UpsertBatch(std::vector<Doc> &docs) {
   std::lock_guard lock(seg_mtx_);
 
-  WriteResults results;
-  results.reserve(docs.size());
+  WriteResults results(docs.size());
+  if (docs.empty()) return results;
 
-  for (auto &doc : docs) {
-    doc.set_operator(Operator::UPSERT);
+  // Upsert never fails per-doc on a pre-existing pk — it just marks
+  // the old doc_id deleted and inserts a new one. Still one multi_get
+  // to find the olds in a single RocksDB call.
+  std::vector<std::string> pks;
+  pks.reserve(docs.size());
+  for (auto &doc : docs) pks.push_back(doc.pk());
 
-    auto s = append_wal(doc);
-    if (!s.ok()) {
-      results.push_back(s);
-      continue;
-    }
-
-    results.push_back(internal_upsert(doc));
+  std::vector<uint64_t> existing_ids;
+  if (id_map_) {
+    auto s = id_map_->multi_get(pks, &existing_ids);
+    if (!s.ok()) return tl::make_unexpected(s);
   }
+
+  std::vector<uint64_t> olds_to_delete;
+  olds_to_delete.reserve(docs.size());
+  std::vector<size_t> ok_indices;
+  ok_indices.reserve(docs.size());
+  for (size_t i = 0; i < docs.size(); ++i) {
+    docs[i].set_operator(Operator::UPSERT);
+    ok_indices.push_back(i);
+    if (!existing_ids.empty() && existing_ids[i] != INVALID_DOC_ID) {
+      olds_to_delete.push_back(existing_ids[i]);
+    }
+  }
+
+  auto s = apply_batched_writes(docs, ok_indices, olds_to_delete, results);
+  if (!s.ok()) return tl::make_unexpected(s);
 
   if (options_.wal_durability_ == WalDurability::PER_BATCH && wal_file_) {
     if (wal_file_->flush() != 0) {
@@ -1079,28 +1229,42 @@ Result<WriteResults> SegmentImpl::UpsertBatch(std::vector<Doc> &docs) {
 Result<WriteResults> SegmentImpl::UpdateBatch(std::vector<Doc> &docs) {
   std::lock_guard lock(seg_mtx_);
 
-  WriteResults results;
-  results.reserve(docs.size());
+  WriteResults results(docs.size());
+  if (docs.empty()) return results;
 
-  for (auto &doc : docs) {
-    uint64_t g_doc_id;
-    if (!id_map_->has(doc.pk(), &g_doc_id)) {
-      results.push_back(Status::NotFound("update failed: doc_id[", doc.pk(),
-                                         "] not found in collection"));
-      continue;
-    }
+  std::vector<std::string> pks;
+  pks.reserve(docs.size());
+  for (auto &doc : docs) pks.push_back(doc.pk());
 
-    doc.set_doc_id(g_doc_id);
-    doc.set_operator(Operator::UPDATE);
-
-    auto s = append_wal(doc);
-    if (!s.ok()) {
-      results.push_back(s);
-      continue;
-    }
-
-    results.push_back(internal_update(doc));
+  std::vector<uint64_t> existing_ids;
+  if (id_map_) {
+    auto s = id_map_->multi_get(pks, &existing_ids);
+    if (!s.ok()) return tl::make_unexpected(s);
   }
+
+  std::vector<uint64_t> olds_to_delete;
+  olds_to_delete.reserve(docs.size());
+  std::vector<size_t> ok_indices;
+  ok_indices.reserve(docs.size());
+  for (size_t i = 0; i < docs.size(); ++i) {
+    if (existing_ids.empty() || existing_ids[i] == INVALID_DOC_ID) {
+      results[i] = Status::NotFound("update failed: doc_id[", docs[i].pk(),
+                                    "] not found in collection");
+      continue;
+    }
+    // Historical per-doc Update set doc.doc_id() to the OLD id before
+    // delegating into internal_update; that path then marks the old id
+    // deleted and inserts a fresh record. The batch pipeline marks the
+    // old id deleted via olds_to_delete and lets apply_batched_writes
+    // assign the NEW id. Record the old id for the WAL for parity.
+    docs[i].set_doc_id(existing_ids[i]);
+    docs[i].set_operator(Operator::UPDATE);
+    olds_to_delete.push_back(existing_ids[i]);
+    ok_indices.push_back(i);
+  }
+
+  auto s = apply_batched_writes(docs, ok_indices, olds_to_delete, results);
+  if (!s.ok()) return tl::make_unexpected(s);
 
   if (options_.wal_durability_ == WalDurability::PER_BATCH && wal_file_) {
     if (wal_file_->flush() != 0) {
@@ -1116,35 +1280,70 @@ Result<WriteResults> SegmentImpl::DeleteBatch(
     const std::vector<std::string> &pks) {
   std::lock_guard lock(seg_mtx_);
 
-  WriteResults results;
-  results.reserve(pks.size());
+  WriteResults results(pks.size());
+  if (pks.empty()) return results;
 
-  for (auto &pk : pks) {
-    uint64_t g_doc_id;
-    if (!id_map_->has(pk, &g_doc_id)) {
-      results.push_back(Status::NotFound("primary key: ", pk, " not found"));
+  std::vector<uint64_t> existing_ids;
+  if (id_map_) {
+    auto s = id_map_->multi_get(pks, &existing_ids);
+    if (!s.ok()) return tl::make_unexpected(s);
+  }
+
+  // Build the set of docs to tombstone, collect serialized WAL records,
+  // and collect the id_map keys to remove. Missing pks and
+  // already-deleted doc_ids surface as per-pk NotFound errors.
+  std::vector<Doc> tombstones;
+  tombstones.reserve(pks.size());
+  std::vector<std::string> wal_records;
+  wal_records.reserve(pks.size());
+  std::vector<std::string> pks_to_remove;
+  pks_to_remove.reserve(pks.size());
+  std::vector<uint64_t> ids_to_mark;
+  ids_to_mark.reserve(pks.size());
+
+  for (size_t i = 0; i < pks.size(); ++i) {
+    if (existing_ids.empty() || existing_ids[i] == INVALID_DOC_ID) {
+      results[i] = Status::NotFound("primary key: ", pks[i], " not found");
       continue;
     }
-    if (delete_store_->is_deleted(g_doc_id)) {
-      results.push_back(Status::NotFound("primary key: ", pk,
-                                         " g_doc_id: ", g_doc_id,
-                                         " already deleted"));
+    if (delete_store_->is_deleted(existing_ids[i])) {
+      results[i] = Status::NotFound("primary key: ", pks[i],
+                                    " g_doc_id: ", existing_ids[i],
+                                    " already deleted");
       continue;
     }
 
     Doc mutable_doc;
-    mutable_doc.set_pk(pk);
-    mutable_doc.set_doc_id(g_doc_id);
+    mutable_doc.set_pk(pks[i]);
+    mutable_doc.set_doc_id(existing_ids[i]);
     mutable_doc.set_operator(Operator::DELETE);
 
-    auto s = append_wal(mutable_doc);
-    if (!s.ok()) {
-      results.push_back(s);
-      continue;
-    }
-
-    results.push_back(internal_delete(mutable_doc));
+    auto buf = mutable_doc.serialize();
+    wal_records.emplace_back(buf.begin(), buf.end());
+    tombstones.push_back(std::move(mutable_doc));
+    pks_to_remove.push_back(pks[i]);
+    ids_to_mark.push_back(existing_ids[i]);
   }
+
+  if (tombstones.empty()) return results;
+
+  // Single append_batch for all delete records.
+  if (!wal_file_) {
+    auto s = open_wal_file();
+    if (!s.ok()) return tl::make_unexpected(s);
+  }
+  if (wal_file_->append_batch(std::move(wal_records)) != 0) {
+    return tl::make_unexpected(
+        Status::InternalError("WAL append_batch failed for Delete batch"));
+  }
+
+  // Mark all doc_ids tombstoned in the delete_store, then remove the
+  // pk→id mappings from RocksDB. We still call id_map_->remove per
+  // pk — rocksdb's DB::Delete accepts only one key at a time through
+  // the public API we're using, and the per-delete overhead is much
+  // smaller than a Put (no value payload).
+  for (auto id : ids_to_mark) delete_store_->mark_deleted(id);
+  for (const auto &pk : pks_to_remove) id_map_->remove(pk);
 
   if (options_.wal_durability_ == WalDurability::PER_BATCH && wal_file_) {
     if (wal_file_->flush() != 0) {

@@ -144,6 +144,46 @@ Status MemForwardStore::insert(const Doc &doc) {
   return Status::OK();
 }
 
+Status MemForwardStore::insert_batch(const std::vector<Doc> &docs) {
+  if (docs.empty()) return Status::OK();
+
+  std::lock_guard lock(cache_mtx_);
+  for (const auto &doc : docs) {
+    cache_.emplace_back(doc);
+    num_rows_++;
+    total_cache_bytes_ =
+        total_cache_bytes_ + static_cast<uint32_t>(doc.memory_usage());
+  }
+
+  // One threshold check at the end of the batch. If the cache is now
+  // over the flush threshold, convert the whole cache to a RecordBatch
+  // and reset, same as the single-doc insert() path above. This keeps
+  // the max_cache_size_ contract: the cache is flushed whenever it
+  // crosses the threshold, only possibly lazily by one batch.
+  if (total_cache_bytes_ < max_cache_size_) {
+    return Status::OK();
+  }
+
+  auto rb_builder = createBuilder();
+  auto status = convertToBuilder(rb_builder);
+  if (!status.ok()) {
+    return Status::InternalError("convertToBuilder error: ", status.ToString());
+  }
+  auto result = rb_builder->Flush(false);
+  if (!result.ok()) {
+    return Status::InternalError("flush error: ", result.status().ToString());
+  }
+  auto rb = result.ValueOrDie();
+  int64_t rb_size = MemorySize(*rb);
+  batches_.push_back(rb);
+
+  total_rb_bytes_ = total_rb_bytes_ + (uint32_t)rb_size;
+  cache_.clear();
+  total_cache_bytes_ = 0;
+
+  return Status::OK();
+}
+
 arrow::Result<RecordBatchPtr> MemForwardStore::convertToRecordBatch() {
   auto rb_builder = createBuilder();
   ARROW_RETURN_NOT_OK(convertToBuilder(rb_builder));

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "id_map.h"
+#include <rocksdb/write_batch.h>
 #include <zvec/ailego/logger/logger.h>
 #include "db/common/constants.h"
 
@@ -109,6 +110,46 @@ Status IDMap::upsert(const std::string &key, uint64_t doc_id) {
               s.ToString().c_str());
     return Status::InternalError();
   }
+}
+
+
+Status IDMap::upsert_batch(const std::vector<std::string> &keys,
+                           const std::vector<uint64_t> &doc_ids) {
+  if (!opened_) {
+    return Status::InternalError();
+  }
+  if (keys.size() != doc_ids.size()) {
+    return Status::InvalidArgument(
+        "IDMap::upsert_batch: keys.size() != doc_ids.size() (",
+        (int)keys.size(), " vs ", (int)doc_ids.size(), ")");
+  }
+  if (keys.empty()) {
+    return Status::OK();
+  }
+
+  rocksdb::WriteBatch batch;
+  for (size_t i = 0; i < keys.size(); ++i) {
+    rocksdb::Slice value((const char *)&doc_ids[i], sizeof(uint64_t));
+    auto s = batch.Put(keys[i], value);
+    if (!s.ok()) {
+      LOG_ERROR(
+          "Failed to stage Put [%s, %zu] into IDMap[%s] batch, code[%d], "
+          "reason[%s]",
+          keys[i].c_str(), (size_t)doc_ids[i], working_dir_.c_str(), s.code(),
+          s.ToString().c_str());
+      return Status::InternalError();
+    }
+  }
+
+  auto s = rocksdb_context_.db_->Write(rocksdb_context_.write_opts_, &batch);
+  if (!s.ok()) {
+    LOG_ERROR(
+        "Failed to commit IDMap[%s] WriteBatch of %zu entries, code[%d], "
+        "reason[%s]",
+        working_dir_.c_str(), keys.size(), s.code(), s.ToString().c_str());
+    return Status::InternalError();
+  }
+  return Status::OK();
 }
 
 

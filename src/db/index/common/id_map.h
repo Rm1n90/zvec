@@ -61,6 +61,12 @@ class IDMap {
 
   Status upsert(const std::string &key, uint64_t doc_id);
 
+  // Batched upsert: writes all (key, doc_id) pairs in a single RocksDB
+  // WriteBatch with one `db_->Write` call. Atomic with respect to crash
+  // recovery — either the whole batch lands or none of it.
+  Status upsert_batch(const std::vector<std::string> &keys,
+                      const std::vector<uint64_t> &doc_ids);
+
   void remove(const std::string &key);
 
   bool has(const std::string &key, uint64_t *doc_id = nullptr) const;

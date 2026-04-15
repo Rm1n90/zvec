@@ -65,6 +65,15 @@ class MemForwardStore : public BaseForwardStore {
   /// \return 0 on success, non-zero on failure
   Status insert(const Doc &doc);
 
+  /// Insert many documents as a single batch. Acquires cache_mtx_ once
+  /// for the whole batch instead of once per doc, and evaluates the
+  /// cache-size flush threshold only at the end. Behavioural invariants
+  /// (threshold-driven flush when the in-memory cache exceeds
+  /// max_cache_size_) are preserved.
+  /// \param docs The documents to insert
+  /// \return Status::OK() on success
+  Status insert_batch(const std::vector<Doc> &docs);
+
   /// Flush cached data to disk
   /// \return 0 on success, non-zero on failure
   Status flush();
