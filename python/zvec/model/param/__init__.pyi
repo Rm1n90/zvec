@@ -12,6 +12,7 @@ import _zvec.typing
 __all__: list[str] = [
     "AddColumnOption",
     "AlterColumnOption",
+    "CancelToken",
     "CollectionOption",
     "FlatIndexParam",
     "FtsIndexParam",
@@ -760,38 +761,80 @@ class MatchOp:
     @property
     def value(self) -> int: ...
 
+class CancelToken:
+    """
+    Cooperative cancellation token for long-running operations (e.g. Optimize).
+
+    When cancelled, the operation aborts at the next check point and returns
+    a cancelled status. Already-committed work is preserved; no partial state
+    is applied.
+    """
+
+    def __init__(self) -> None:
+        """Create a fresh, not-yet-cancelled token."""
+
+    def cancel(self) -> None:
+        """Request cancellation. Idempotent."""
+
+    @property
+    def is_cancelled(self) -> bool:
+        """bool: True if cancel() has been called."""
+
 class OptimizeOption:
     """
 
     Options for optimizing a collection (e.g., merging segments).
 
     Attributes:
-        concurrency (int): Number of threads to use during optimization.
-            If 0, the system will choose an optimal value automatically.
-            Default is 0.
+        concurrency (int): Per-task inner parallelism — threads used inside
+            a single compact/index build task. 0 = auto.
+        parallel_tasks (int): Maximum number of compact/index tasks that
+            may run concurrently. 0 = auto. 1 restores legacy sequential.
+        memory_budget_bytes (int): Soft memory budget across all concurrent
+            tasks. 0 = unlimited.
+        per_doc_memory_estimate_bytes (int): Per-input-doc memory estimate
+            used by the admission controller. 0 = default (512).
+        cancel_token (CancelToken | None): Optional cancellation handle.
 
     Examples:
         >>> opt = OptimizeOption(concurrency=2)
         >>> print(opt.concurrency)
         2
+        >>> opt2 = OptimizeOption(concurrency=2, parallel_tasks=4,
+        ...                       memory_budget_bytes=4 * 1024**3)
     """
 
     def __getstate__(self) -> tuple: ...
-    def __init__(self, concurrency: typing.SupportsInt = 0) -> None:
-        """
-        Constructs an OptimizeOption instance.
-
-        Args:
-            concurrency (int, optional): Number of concurrent threads.
-                0 means auto-detect. Defaults to 0.
-        """
+    def __init__(
+        self,
+        concurrency: typing.SupportsInt = 0,
+        parallel_tasks: typing.SupportsInt = 0,
+        memory_budget_bytes: typing.SupportsInt = 0,
+        per_doc_memory_estimate_bytes: typing.SupportsInt = 0,
+        cancel_token: typing.Optional[CancelToken] = None,
+    ) -> None:
+        """Constructs an OptimizeOption instance."""
 
     def __setstate__(self, arg0: tuple) -> None: ...
     @property
     def concurrency(self) -> int:
-        """
-        int: Number of threads used for optimization (0 = auto).
-        """
+        """int: Per-task inner parallelism (0 = auto)."""
+
+    @property
+    def parallel_tasks(self) -> int:
+        """int: Outer dispatch concurrency (0 = auto, 1 = sequential)."""
+
+    @property
+    def memory_budget_bytes(self) -> int:
+        """int: Soft RSS budget for concurrent tasks (0 = unlimited)."""
+
+    @property
+    def per_doc_memory_estimate_bytes(self) -> int:
+        """int: Admission-controller per-doc memory heuristic."""
+
+    @property
+    def cancel_token(self) -> typing.Optional[CancelToken]:
+        """CancelToken | None: Optional cancellation handle."""
 
 class QueryParam:
     """

@@ -16,6 +16,7 @@ from __future__ import annotations
 from _zvec.param import (
     AddColumnOption,
     AlterColumnOption,
+    CancelToken,
     CollectionOption,
     FlatIndexParam,
     FtsIndexParam,
@@ -34,6 +35,7 @@ from _zvec.param import (
 __all__ = [
     "AddColumnOption",
     "AlterColumnOption",
+    "CancelToken",
     "CollectionOption",
     "FlatIndexParam",
     "FtsIndexParam",

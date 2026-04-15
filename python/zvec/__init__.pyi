@@ -15,6 +15,7 @@ from .model.doc import Doc
 from .model.param import (
     AddColumnOption,
     AlterColumnOption,
+    CancelToken,
     CollectionOption,
     FlatIndexParam,
     FtsIndexParam,
@@ -47,6 +48,7 @@ from .zvec import create_and_open, init, open
 __all__: list = [
     "AddColumnOption",
     "AlterColumnOption",
+    "CancelToken",
     "Collection",
     "CollectionOption",
     "CollectionSchema",

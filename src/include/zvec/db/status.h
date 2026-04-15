@@ -159,6 +159,16 @@ class Status {
                   concat(std::forward<Args>(args)...));
   }
 
+  /// @brief Factory: Cancelled (maps onto UNAVAILABLE in the public enum so
+  /// callers already handling "the requested operation isn't runnable right
+  /// now" keep working; the message distinguishes user-initiated cancellation
+  /// from transient unavailability).
+  template <typename... Args>
+  static Status Cancelled(Args &&...args) {
+    return Status(StatusCode::UNAVAILABLE,
+                  concat(std::forward<Args>(args)...));
+  }
+
   // Add more factories as needed...
 
  private:

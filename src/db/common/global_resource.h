@@ -33,9 +33,21 @@ class GlobalResource : public ailego::Singleton<GlobalResource> {
     return optimize_thread_pool_.get();
   }
 
+  // Outer dispatch pool used by Optimize to run N compact/index tasks
+  // concurrently. Each worker here orchestrates one task; the per-task CPU
+  // work (e.g. HNSW build) is submitted to `optimize_thread_pool_`. Sharing a
+  // single pool for both tiers would deadlock on bounded pools when inner
+  // work is enqueued behind outer-holding-thread tasks, so we keep them
+  // separate.
+  ailego::ThreadPool *compact_dispatch_pool() {
+    initialize();
+    return compact_dispatch_pool_.get();
+  }
+
  private:
   std::unique_ptr<ailego::ThreadPool> query_thread_pool_;
   std::unique_ptr<ailego::ThreadPool> optimize_thread_pool_;
+  std::unique_ptr<ailego::ThreadPool> compact_dispatch_pool_;
 };
 
 }  // namespace zvec

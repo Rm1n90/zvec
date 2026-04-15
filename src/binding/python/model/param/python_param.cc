@@ -16,6 +16,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <zvec/core/interface/constants.h>
+#include <zvec/db/cancellation.h>
 #include <zvec/db/index_params.h>
 #include "python_doc.h"
 
@@ -1108,42 +1109,138 @@ Args:
             return obj;
           }));
 
+  // CancelToken — cooperative cancellation for long-running ops such as
+  // Optimize. Surfaced to Python so users can cancel a running optimization
+  // from another thread/coroutine.
+  py::class_<CancelToken, CancelToken::Ptr>(m, "CancelToken", R"pbdoc(
+Cooperative cancellation token for long-running operations (e.g. Optimize).
+
+When cancelled, the operation aborts at the next check point and returns a
+cancelled status. Already-committed work is preserved; no partial state is
+applied.
+
+Examples:
+    >>> token = CancelToken()
+    >>> # In another thread:
+    >>> token.cancel()
+    >>> token.is_cancelled
+    True
+)pbdoc")
+      .def(py::init<>(),
+           R"pbdoc(
+Create a fresh, not-yet-cancelled token.
+)pbdoc")
+      .def("cancel", &CancelToken::cancel,
+           R"pbdoc(
+Request cancellation. Idempotent — safe to call multiple times.
+)pbdoc")
+      .def_property_readonly(
+          "is_cancelled", &CancelToken::is_cancelled,
+          "bool: True if cancel() has been called, False otherwise.");
+
   // OptimizeOptions
   py::class_<OptimizeOptions>(m, "OptimizeOption", R"pbdoc(
 Options for optimizing a collection (e.g., merging segments).
 
 Attributes:
-    concurrency (int): Number of threads to use during optimization.
-        If 0, the system will choose an optimal value automatically.
-        Default is 0.
+    concurrency (int): Per-task inner parallelism — threads used inside a
+        single compact/index build task. 0 = auto (GlobalConfig default).
+    parallel_tasks (int): Maximum number of compact/index tasks that may
+        run concurrently. 0 = auto (compact_dispatch_pool size). 1 restores
+        the legacy sequential behaviour.
+    memory_budget_bytes (int): Soft memory budget across all concurrent
+        tasks. 0 = unlimited. The admission controller will not dispatch a
+        new task if doing so would push estimated peak RSS above this value.
+    per_doc_memory_estimate_bytes (int): Per-input-doc memory estimate used
+        by the admission controller. Default 512 B/doc.
+    cancel_token (CancelToken): Optional token; cancelling it aborts the
+        Optimize call at the next check point.
 
 Examples:
     >>> opt = OptimizeOption(concurrency=2)
     >>> print(opt.concurrency)
     2
+    >>> opt2 = OptimizeOption(concurrency=2, parallel_tasks=4,
+    ...                       memory_budget_bytes=4 * 1024**3)
 )pbdoc")
-      .def(py::init<int>(), py::arg("concurrency") = 0,
+      .def(py::init([](int concurrency, int parallel_tasks,
+                       uint64_t memory_budget_bytes,
+                       uint64_t per_doc_memory_estimate_bytes,
+                       CancelToken::Ptr cancel_token) {
+             OptimizeOptions opt;
+             opt.concurrency_ = concurrency;
+             opt.parallel_tasks_ = parallel_tasks;
+             opt.memory_budget_bytes_ = memory_budget_bytes;
+             if (per_doc_memory_estimate_bytes > 0) {
+               opt.per_doc_memory_estimate_bytes_ =
+                   per_doc_memory_estimate_bytes;
+             }
+             opt.cancel_token_ = std::move(cancel_token);
+             return opt;
+           }),
+           py::arg("concurrency") = 0, py::arg("parallel_tasks") = 0,
+           py::arg("memory_budget_bytes") = 0,
+           py::arg("per_doc_memory_estimate_bytes") = 0,
+           py::arg("cancel_token") = CancelToken::Ptr{nullptr},
            R"pbdoc(
 Constructs an OptimizeOption instance.
 
 Args:
-    concurrency (int, optional): Number of concurrent threads.
-        0 means auto-detect. Defaults to 0.
+    concurrency (int, optional): Per-task inner parallelism. 0 = auto.
+    parallel_tasks (int, optional): Max outer dispatch concurrency. 0 = auto.
+    memory_budget_bytes (int, optional): Soft RSS budget. 0 = unlimited.
+    per_doc_memory_estimate_bytes (int, optional): Admission heuristic.
+        0 = use built-in default (512).
+    cancel_token (CancelToken, optional): Cancellation handle.
 )pbdoc")
       .def_property_readonly(
           "concurrency",
           [](const OptimizeOptions &self) { return self.concurrency_; },
-          "int: Number of threads used for optimization (0 = auto).")
+          "int: Per-task inner parallelism (0 = auto).")
+      .def_property_readonly(
+          "parallel_tasks",
+          [](const OptimizeOptions &self) { return self.parallel_tasks_; },
+          "int: Outer dispatch concurrency (0 = auto, 1 = sequential).")
+      .def_property_readonly(
+          "memory_budget_bytes",
+          [](const OptimizeOptions &self) {
+            return self.memory_budget_bytes_;
+          },
+          "int: Soft RSS budget for concurrent tasks (0 = unlimited).")
+      .def_property_readonly(
+          "per_doc_memory_estimate_bytes",
+          [](const OptimizeOptions &self) {
+            return self.per_doc_memory_estimate_bytes_;
+          },
+          "int: Admission-controller per-doc memory heuristic.")
+      .def_property_readonly(
+          "cancel_token",
+          [](const OptimizeOptions &self) { return self.cancel_token_; },
+          "CancelToken: Optional cancellation handle (may be None).")
       .def(py::pickle(
           [](const OptimizeOptions &self) {
-            return py::make_tuple(self.concurrency_);
+            // Pickle the static config only; cancel_token_ is a live
+            // runtime handle and deliberately not part of the persisted
+            // representation.
+            return py::make_tuple(self.concurrency_, self.parallel_tasks_,
+                                  self.memory_budget_bytes_,
+                                  self.per_doc_memory_estimate_bytes_);
           },
           [](py::tuple t) {
-            if (t.size() != 1)
+            // Accept both the pre-Phase-1 1-tuple and the new 4-tuple so
+            // previously pickled collections/objects remain loadable.
+            OptimizeOptions obj{};
+            if (t.size() == 1) {
+              obj.concurrency_ = t[0].cast<int>();
+            } else if (t.size() == 4) {
+              obj.concurrency_ = t[0].cast<int>();
+              obj.parallel_tasks_ = t[1].cast<int>();
+              obj.memory_budget_bytes_ = t[2].cast<uint64_t>();
+              obj.per_doc_memory_estimate_bytes_ = t[3].cast<uint64_t>();
+            } else {
               throw std::runtime_error(
                   "Invalid pickle data for OptimizeOptions");
-            OptimizeOptions obj{};
-            obj.concurrency_ = t[0].cast<int>();
+            }
             return obj;
           }));
 

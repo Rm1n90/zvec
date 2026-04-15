@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#include <atomic>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
 
@@ -26,14 +27,23 @@
 #pragma GCC diagnostic pop
 #endif
 
-namespace google {
-namespace glog_internal_namespace_ {
-extern bool IsGoogleLoggingInitialized(void);
-extern bool ShutdownGoogleLoggingUtilities(void);
-}  // namespace glog_internal_namespace_
-}  // namespace google
-
 namespace zvec {
+
+// Process-local tracker of whether glog has been initialised by us.
+//
+// glog exposes google::InitGoogleLogging / google::ShutdownGoogleLogging but
+// NOT a public way to ask "is glog already initialised?" — the only query
+// lives in google::glog_internal_namespace_::IsGoogleLoggingInitialized,
+// which is a private (hidden-visibility) symbol on builds that pass
+// -fvisibility=hidden to the glog library. Linking against it pulls an
+// unresolved symbol, so we maintain our own flag instead. Since glog is a
+// process-global singleton, one atomic in this translation unit is
+// sufficient to coordinate the init/shutdown pair across any number of
+// AppendLogger instances.
+inline std::atomic<bool> &append_logger_glog_initialised() {
+  static std::atomic<bool> flag{false};
+  return flag;
+}
 
 class AppendLogger : public ailego::Logger {
  public:
@@ -45,40 +55,50 @@ class AppendLogger : public ailego::Logger {
 
  public:
   int init(const ailego::Params &params) override {
-    if (!google::glog_internal_namespace_::IsGoogleLoggingInitialized()) {
-      std::string log_dir = params.get_as_string("proxima.file.logger.log_dir");
-      std::string log_file =
-          params.get_as_string("proxima.file.logger.log_file");
-      uint32_t log_file_size =
-          params.get_as_uint32("proxima.file.logger.file_size");
-      uint32_t log_overdue_days =
-          params.get_as_uint32("proxima.file.logger.overdue_days");
-
-      if (!ailego::File::IsExist(log_dir)) {
-        ailego::File::MakePath(log_dir);
-      }
-
-      FLAGS_log_dir = log_dir;
-      FLAGS_max_log_size = log_file_size;
-      FLAGS_logbufsecs = 1;
-      // it's really a bad feature for glog
-      // logs <= LOG_FATAL will also output to stderr
-      // and we can only set FATAL at most
-      // and so we should avoid to use LOG_FATAL
-      FLAGS_stderrthreshold = google::GLOG_FATAL;
-
-      static std::string new_log_file = log_file;
-      google::InitGoogleLogging(new_log_file.c_str());
-      google::EnableLogCleaner(log_overdue_days);
+    bool expected = false;
+    if (!append_logger_glog_initialised().compare_exchange_strong(expected,
+                                                                  true)) {
+      // Already initialised by another AppendLogger in this process.
+      return 0;
     }
+
+    std::string log_dir = params.get_as_string("proxima.file.logger.log_dir");
+    std::string log_file =
+        params.get_as_string("proxima.file.logger.log_file");
+    uint32_t log_file_size =
+        params.get_as_uint32("proxima.file.logger.file_size");
+    uint32_t log_overdue_days =
+        params.get_as_uint32("proxima.file.logger.overdue_days");
+
+    if (!ailego::File::IsExist(log_dir)) {
+      ailego::File::MakePath(log_dir);
+    }
+
+    FLAGS_log_dir = log_dir;
+    FLAGS_max_log_size = log_file_size;
+    FLAGS_logbufsecs = 1;
+    // it's really a bad feature for glog
+    // logs <= LOG_FATAL will also output to stderr
+    // and we can only set FATAL at most
+    // and so we should avoid to use LOG_FATAL
+    FLAGS_stderrthreshold = google::GLOG_FATAL;
+
+    static std::string new_log_file = log_file;
+    google::InitGoogleLogging(new_log_file.c_str());
+    google::EnableLogCleaner(log_overdue_days);
     return 0;
   }
 
   int cleanup() override {
-    if (google::glog_internal_namespace_::IsGoogleLoggingInitialized()) {
-      google::DisableLogCleaner();
-      google::ShutdownGoogleLogging();
+    bool expected = true;
+    if (!append_logger_glog_initialised().compare_exchange_strong(expected,
+                                                                  false)) {
+      // Either never initialised by us, or another AppendLogger has already
+      // shut glog down in this process.
+      return 0;
     }
+    google::DisableLogCleaner();
+    google::ShutdownGoogleLogging();
     return 0;
   }
 

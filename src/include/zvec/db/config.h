@@ -97,6 +97,13 @@ class GlobalConfig : public ailego::Singleton<GlobalConfig> {
     // optimize
     uint32_t optimize_thread_count;
 
+    // Outer dispatch pool for Optimize. Schedules N compact/index tasks in
+    // parallel; inner CPU work within a task still uses `optimize_thread_count`
+    // via the existing optimize thread pool. Separate pool prevents
+    // inner/outer deadlock on bounded pools and lets operators tune outer
+    // concurrency independently of per-task CPU usage.
+    uint32_t compact_dispatch_thread_count;
+
     ConfigData();
   };
 
@@ -170,6 +177,13 @@ class GlobalConfig : public ailego::Singleton<GlobalConfig> {
   //! Optimize thread count
   uint32_t optimize_thread_count() const noexcept {
     return config_.optimize_thread_count;
+  }
+
+  //! Outer compact-dispatch thread count (Phase 1 of the optimization
+  //! pipeline). Each thread orchestrates one compact/index task and
+  //! sub-dispatches its per-task work to the inner optimize thread pool.
+  uint32_t compact_dispatch_thread_count() const noexcept {
+    return config_.compact_dispatch_thread_count;
   }
 
  private:

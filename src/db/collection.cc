@@ -14,14 +14,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
+#include "db/common/global_resource.h"
 #include <ailego/io/file_lock.h>
 #include <zvec/ailego/io/file.h>
 #include <zvec/ailego/logger/logger.h>
@@ -173,7 +176,16 @@ class CollectionImpl : public Collection {
       const std::vector<Segment::Ptr> &segments, int concurrency,
       const IndexFilter::Ptr filter);
 
-  Status execute_compact_task(std::vector<SegmentTask::Ptr> &tasks) const;
+  // Dispatch compact/create-index tasks. Parallelism is bounded by
+  // `options.parallel_tasks_` (falls back to compact_dispatch_pool size when
+  // 0), and by `options.memory_budget_bytes_` via an estimated per-task
+  // memory footprint (sum(input.doc_count) * per_doc_memory_estimate_bytes_).
+  // Cancellation is checked between admissions; any task failure short-
+  // circuits further dispatch and returns the first error (but already-
+  // running tasks still complete — their results are discarded by the
+  // caller on error).
+  Status execute_compact_task(std::vector<SegmentTask::Ptr> &tasks,
+                              const OptimizeOptions &options) const;
 
   std::vector<SegmentTask::Ptr> build_create_vector_index_task(
       const std::vector<Segment::Ptr> &segments, const std::string &column,
@@ -215,6 +227,19 @@ class CollectionImpl : public Collection {
 
   CollectionOptions options_;
 
+  // Lock ordering (always acquire in this order to avoid deadlock):
+  //   ddl_mtx_   (exclusive during any DDL, including Optimize)
+  //     -> schema_handle_mtx_  (shared for reads / writes, exclusive briefly
+  //                             during commit-style schema mutations)
+  //       -> write_mtx_         (exclusive for writes, rotation, commit)
+  //
+  // ddl_mtx_ was introduced in Phase 1 of the optimization pipeline: it
+  // serialises DDL-with-DDL (and DDL-with-Optimize) so that Optimize can
+  // release schema_handle_mtx_ during its long compact phase without another
+  // DDL mutating the schema concurrently. Without this mutex, downgrading
+  // schema_handle_mtx_ from exclusive to shared (or releasing it mid-call)
+  // would race with a concurrent CreateIndex/DropIndex/etc.
+  mutable std::mutex ddl_mtx_;
   mutable std::shared_mutex schema_handle_mtx_;
   mutable std::shared_mutex write_mtx_;
 
@@ -441,6 +466,11 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
                                    const CreateIndexOptions &options) {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
+  // ddl_mtx_ serialises DDL-with-DDL (including Optimize); the exclusive
+  // schema_handle_mtx_ below still blocks queries/writes for the duration
+  // of this CreateIndex (unchanged behaviour — shrinking this lock scope is
+  // a later phase concern).
+  std::lock_guard<std::mutex> ddl_lock(ddl_mtx_);
   std::lock_guard lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
@@ -630,6 +660,7 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
 
+  std::lock_guard<std::mutex> ddl_lock(ddl_mtx_);
   std::lock_guard lock(schema_handle_mtx_);
 
   auto new_schema = std::make_shared<CollectionSchema>(*schema_);
@@ -794,129 +825,183 @@ std::vector<SegmentTask::Ptr> CollectionImpl::build_drop_scalar_index_task(
 Status CollectionImpl::Optimize(const OptimizeOptions &options) {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
-  std::lock_guard lock(schema_handle_mtx_);
-  // when optimizing, schema operations(include another optimize) are not
-  // allowed
+  // === Phase 0 — DDL serialisation ========================================
+  // ddl_mtx_ is held for the entire Optimize. It serialises with other DDL
+  // (CreateIndex / DropIndex / AddColumn / AlterColumn / DropColumn) and
+  // with concurrent Optimize calls, replacing the previous reliance on
+  // holding schema_handle_mtx_ exclusively for the entire call.
+  std::lock_guard<std::mutex> ddl_lock(ddl_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
 
-  std::vector<Segment::Ptr> persist_segments;
+  const CancelToken::Ptr cancel = options.cancel_token_;
+  auto check_cancel = [&]() -> Status {
+    if (cancel && cancel->is_cancelled()) {
+      return Status::Cancelled("optimize cancelled");
+    }
+    return Status::OK();
+  };
 
+  // === Phase 1 — quiesce (brief) ==========================================
+  // Rotate the writing segment so that subsequent writes land in a fresh
+  // segment that is NOT part of the compact input set. Writers are blocked
+  // only for the duration of the rotation — tens of ms, not the whole
+  // Optimize. Queries continue throughout.
+  std::vector<Segment::Ptr> persist_segments;
   {
-    // forbidden writing for a while
-    std::lock_guard write_lock(write_mtx_);
+    std::shared_lock<std::shared_mutex> schema_lock(schema_handle_mtx_);
+    std::lock_guard<std::shared_mutex> write_lock(write_mtx_);
 
     if (writing_segment_->doc_count() != 0) {
-      // flush and create new segment
       auto s = switch_to_new_segment_for_writing();
-      if (!s.ok()) {
-        return s;
-      }
+      if (!s.ok()) return s;
     }
 
-    persist_segments =
-        get_all_persist_segments();  // will not return writing segment
-    // after leave this scope, writing action is allowed
+    persist_segments = get_all_persist_segments();
   }
 
-  if (persist_segments.size() == 0) {
-    // no need to optimize
-    return Status::OK();
-  }
+  if (persist_segments.empty()) return Status::OK();
 
-  // build segment compact task
+  CHECK_RETURN_STATUS(check_cancel());
+
+  // === Phase 2 — build tasks (no locks held) ==============================
+  // delete_store_ has its own internal synchronisation; clone is safe
+  // without holding schema/write locks.
   auto delete_store_clone = delete_store_->clone();
   auto tasks =
       build_compact_task(schema_, persist_segments, options.concurrency_,
                          delete_store_clone->make_filter());
+  if (tasks.empty()) return Status::OK();
 
-  // execute segment compact task
-  auto s = execute_compact_task(tasks);
-  CHECK_RETURN_STATUS(s);
-
+  // === Phase 3 — execute tasks in parallel (no schema/write locks) ========
+  // Concurrent writers and queries run freely during this (typically long)
+  // phase. DDL is blocked via ddl_mtx_.
   {
-    // forbidden writing for updating version
-    // writing action may trigger updating version where confict occurs
-    std::lock_guard write_lock(write_mtx_);
+    auto s = execute_compact_task(tasks, options);
+    CHECK_RETURN_STATUS(s);
+  }
+
+  CHECK_RETURN_STATUS(check_cancel());
+
+  // === Phase 4 — pre-stage outputs (no locks held) ========================
+  // Rename tmp segment directories to their final locations and pre-open
+  // the resulting Segment objects. This is the dominant commit-time cost
+  // (mmap + vector index load) and historically ran under write_mtx_; doing
+  // it outside the lock unblocks writers during this window.
+  //
+  // Crash invariant: on a crash between rename and version.flush() the
+  // renamed directory is orphaned but not referenced by the manifest. This
+  // matches the pre-existing behaviour; recovery handles it by ignoring
+  // directories not present in the manifest.
+  struct PreStagedOutput {
+    bool is_compact{false};
+    bool has_output{false};
+    // Compact-task output (filled when is_compact && has_output):
+    Segment::Ptr pre_opened_segment;  // ready to add to segment_manager_
+    // Input segments to destroy after commit (for CompactTask):
+    std::vector<Segment::Ptr> inputs_to_destroy;
+  };
+
+  std::vector<PreStagedOutput> pre_staged(tasks.size());
+  for (size_t i = 0; i < tasks.size(); ++i) {
+    auto &task_info = tasks[i]->task_info();
+    if (std::holds_alternative<CompactTask>(task_info)) {
+      auto &compact_task = std::get<CompactTask>(task_info);
+      pre_staged[i].is_compact = true;
+      pre_staged[i].inputs_to_destroy = compact_task.input_segments_;
+
+      if (compact_task.output_segment_meta_) {
+        pre_staged[i].has_output = true;
+
+        auto tmp_segment_id = compact_task.output_segment_id_;
+        auto tmp_segment_path =
+            FileHelper::MakeTempSegmentPath(path_, tmp_segment_id);
+
+        auto new_segment_id = allocate_segment_id();
+        auto new_segment_path =
+            FileHelper::MakeSegmentPath(path_, new_segment_id);
+
+        if (!FileHelper::MoveDirectory(tmp_segment_path, new_segment_path)) {
+          return Status::InternalError("move segment directory failed");
+        }
+
+        // The output meta's id now reflects the final segment location.
+        compact_task.output_segment_meta_->set_id(new_segment_id);
+
+        auto pre_opened = Segment::Open(
+            path_, *schema_, *compact_task.output_segment_meta_, id_map_,
+            delete_store_, version_manager_,
+            SegmentOptions{true, options_.enable_mmap_});
+        if (!pre_opened.has_value()) {
+          return pre_opened.error();
+        }
+        pre_staged[i].pre_opened_segment = std::move(pre_opened.value());
+      }
+    }
+  }
+
+  CHECK_RETURN_STATUS(check_cancel());
+
+  // === Phase 5 — commit (brief exclusive locks) ===========================
+  // Now take schema_handle_mtx_ exclusive (blocks queries and writes) +
+  // write_mtx_ exclusive. The body is intentionally minimal: apply the
+  // merged version, fsync the manifest, swap segments in/out of
+  // segment_manager_, and reload indexers. Heavy IO already happened in
+  // Phase 4.
+  {
+    std::lock_guard<std::shared_mutex> schema_lock(schema_handle_mtx_);
+    std::lock_guard<std::shared_mutex> write_lock(write_mtx_);
 
     Version new_version = version_manager_->get_current_version();
 
-    for (auto &task : tasks) {
-      auto task_info = task->task_info();
+    for (size_t i = 0; i < tasks.size(); ++i) {
+      auto &task_info = tasks[i]->task_info();
 
       if (std::holds_alternative<CompactTask>(task_info)) {
-        auto compact_task = std::get<CompactTask>(task_info);
+        auto &compact_task = std::get<CompactTask>(task_info);
 
-        // 0. check if has output segment meta
         if (compact_task.output_segment_meta_) {
-          // 1. rename built tmp segments
-          auto tmp_segment_id = compact_task.output_segment_id_;
-          auto tmp_segment_path =
-              FileHelper::MakeTempSegmentPath(path_, tmp_segment_id);
-
-          auto new_segment_id = allocate_segment_id();
-          auto new_segment_path =
-              FileHelper::MakeSegmentPath(path_, new_segment_id);
-
-          if (!FileHelper::MoveDirectory(tmp_segment_path, new_segment_path)) {
-            return Status::InternalError("move segment directory failed");
-          }
-
-          // update output_segment_meta_'s segment id
-          compact_task.output_segment_meta_->set_id(new_segment_id);
-
-          s = new_version.add_persisted_segment_meta(
+          auto s = new_version.add_persisted_segment_meta(
               compact_task.output_segment_meta_);
           CHECK_RETURN_STATUS(s);
           new_version.set_next_segment_id(segment_id_allocator_.load());
         }
 
-        for (auto input_segment : compact_task.input_segments_) {
-          s = new_version.remove_persisted_segment_meta(input_segment->id());
+        for (auto &input_segment : compact_task.input_segments_) {
+          auto s =
+              new_version.remove_persisted_segment_meta(input_segment->id());
           CHECK_RETURN_STATUS(s);
         }
       } else if (std::holds_alternative<CreateVectorIndexTask>(task_info)) {
-        auto create_index_task = std::get<CreateVectorIndexTask>(task_info);
-        s = new_version.update_persisted_segment_meta(
+        auto &create_index_task = std::get<CreateVectorIndexTask>(task_info);
+        auto s = new_version.update_persisted_segment_meta(
             create_index_task.output_segment_meta_);
         CHECK_RETURN_STATUS(s);
       }
     }
 
-    // 2. update version
-    s = version_manager_->apply(new_version);
+    auto s = version_manager_->apply(new_version);
     CHECK_RETURN_STATUS(s);
 
-    // 3. persist version
     s = version_manager_->flush();
     CHECK_RETURN_STATUS(s);
 
-    // 4. remove old segments or block
-    for (auto &task : tasks) {
-      auto task_info = task->task_info();
+    // Swap segments under the manager. This is a pointer-level operation
+    // plus reload_vector_index (which itself takes a per-segment lock).
+    for (size_t i = 0; i < tasks.size(); ++i) {
+      auto &task_info = tasks[i]->task_info();
 
       if (std::holds_alternative<CompactTask>(task_info)) {
-        auto compact_task = std::get<CompactTask>(task_info);
-
-        if (compact_task.output_segment_meta_) {
-          auto new_segment =
-              Segment::Open(path_, *schema_, *compact_task.output_segment_meta_,
-                            id_map_, delete_store_, version_manager_,
-                            SegmentOptions{true, options_.enable_mmap_});
-          if (!new_segment.has_value()) {
-            return new_segment.error();
-          }
-          s = segment_manager_->add_segment(new_segment.value());
+        if (pre_staged[i].has_output) {
+          s = segment_manager_->add_segment(pre_staged[i].pre_opened_segment);
           CHECK_RETURN_STATUS(s);
         }
-
-        for (auto input_segment : compact_task.input_segments_) {
+        for (auto &input_segment : pre_staged[i].inputs_to_destroy) {
           s = segment_manager_->destroy_segment(input_segment->id());
           CHECK_RETURN_STATUS(s);
         }
       } else if (std::holds_alternative<CreateVectorIndexTask>(task_info)) {
-        auto create_index_task = std::get<CreateVectorIndexTask>(task_info);
-
+        auto &create_index_task = std::get<CreateVectorIndexTask>(task_info);
         s = create_index_task.input_segment_->reload_vector_index(
             *schema_, create_index_task.output_segment_meta_,
             create_index_task.output_vector_indexers_,
@@ -1019,16 +1104,166 @@ std::vector<SegmentTask::Ptr> CollectionImpl::build_compact_task(
   return tasks;
 }
 
+namespace {
+
+// Estimate peak working-set memory for a single compact/index task. The
+// estimate is intentionally rough (we don't have byte-level accounting on
+// segments yet) but is stable across tasks so the admission controller can
+// compare them fairly. Used only for soft throttling; it never rejects a
+// task forever — a task larger than the budget runs alone once all other
+// admitted tasks have drained.
+uint64_t EstimateTaskMemoryBytes(const SegmentTask::Ptr &task,
+                                 uint64_t per_doc_bytes) {
+  if (!task) return 0;
+  uint64_t total_docs = 0;
+  auto &info = task->task_info();
+  if (std::holds_alternative<CompactTask>(info)) {
+    for (auto &seg : std::get<CompactTask>(info).input_segments_) {
+      if (seg) total_docs += seg->doc_count();
+    }
+  } else if (std::holds_alternative<CreateVectorIndexTask>(info)) {
+    auto &t = std::get<CreateVectorIndexTask>(info);
+    if (t.input_segment_) total_docs += t.input_segment_->doc_count();
+  } else if (std::holds_alternative<CreateScalarIndexTask>(info)) {
+    auto &t = std::get<CreateScalarIndexTask>(info);
+    if (t.input_segment_) total_docs += t.input_segment_->doc_count();
+  } else if (std::holds_alternative<DropVectorIndexTask>(info)) {
+    auto &t = std::get<DropVectorIndexTask>(info);
+    if (t.input_segment_) total_docs += t.input_segment_->doc_count();
+  } else if (std::holds_alternative<DropScalarIndexTask>(info)) {
+    auto &t = std::get<DropScalarIndexTask>(info);
+    if (t.input_segment_) total_docs += t.input_segment_->doc_count();
+  }
+  return total_docs * per_doc_bytes;
+}
+
+}  // namespace
+
 Status CollectionImpl::execute_compact_task(
-    std::vector<SegmentTask::Ptr> &tasks) const {
-  Status s;
-  for (auto &task : tasks) {
-    s = SegmentHelper::Execute(task);
-    if (!s.ok()) {
-      return s;
+    std::vector<SegmentTask::Ptr> &tasks,
+    const OptimizeOptions &options) const {
+  if (tasks.empty()) return Status::OK();
+
+  auto *dispatch_pool = GlobalResource::Instance().compact_dispatch_pool();
+
+  const uint32_t pool_size =
+      static_cast<uint32_t>(std::max<size_t>(1, dispatch_pool->count()));
+  uint32_t max_parallel = options.parallel_tasks_ > 0
+                              ? static_cast<uint32_t>(options.parallel_tasks_)
+                              : pool_size;
+  max_parallel = std::min<uint32_t>(
+      max_parallel, static_cast<uint32_t>(tasks.size()));
+  max_parallel = std::max<uint32_t>(max_parallel, 1u);
+
+  const uint64_t memory_budget = options.memory_budget_bytes_;
+  const uint64_t per_doc_bytes =
+      options.per_doc_memory_estimate_bytes_ > 0
+          ? options.per_doc_memory_estimate_bytes_
+          : 512ULL;
+  const CancelToken::Ptr cancel = options.cancel_token_;
+
+  // Pre-compute per-task memory estimates once so the admission loop is
+  // allocation-free under the mutex.
+  std::vector<uint64_t> task_bytes;
+  task_bytes.reserve(tasks.size());
+  for (auto &t : tasks) {
+    task_bytes.push_back(EstimateTaskMemoryBytes(t, per_doc_bytes));
+  }
+
+  std::mutex state_mtx;
+  std::condition_variable state_cv;
+  uint32_t active_count = 0;
+  uint64_t active_bytes = 0;
+  Status first_error;  // OK unless a task (or cancel) wins the race to set it
+  bool aborted = false;
+
+  auto record_result = [&](Status &&s) {
+    std::lock_guard<std::mutex> lk(state_mtx);
+    if (!s.ok() && first_error.ok()) {
+      first_error = std::move(s);
+      aborted = true;
+    }
+  };
+
+  for (size_t i = 0; i < tasks.size(); ++i) {
+    if (cancel && cancel->is_cancelled()) {
+      std::lock_guard<std::mutex> lk(state_mtx);
+      if (first_error.ok()) {
+        first_error = Status::Cancelled("optimize cancelled");
+      }
+      aborted = true;
+      break;
+    }
+
+    const uint64_t need_bytes = task_bytes[i];
+
+    {
+      std::unique_lock<std::mutex> lk(state_mtx);
+      state_cv.wait(lk, [&] {
+        if (aborted) return true;
+        if (active_count >= max_parallel) return false;
+        // Memory admission: skip when budget is disabled, the task fits,
+        // or nothing else is running (prevents deadlock on an oversized
+        // single task vs. a tight budget).
+        if (memory_budget == 0) return true;
+        if (active_count == 0) return true;
+        return active_bytes + need_bytes <= memory_budget;
+      });
+      if (aborted) break;
+      ++active_count;
+      active_bytes += need_bytes;
+    }
+
+    SegmentTask::Ptr *task_slot = &tasks[i];
+
+    try {
+      dispatch_pool->execute(
+          [task_slot, need_bytes, &state_mtx, &state_cv, &active_count,
+           &active_bytes, &record_result]() {
+            Status s;
+            try {
+              s = SegmentHelper::Execute(*task_slot);
+            } catch (const std::exception &e) {
+              s = Status::InternalError("compact task threw: ", e.what());
+            } catch (...) {
+              s = Status::InternalError("compact task threw unknown exception");
+            }
+            record_result(std::move(s));
+            {
+              std::lock_guard<std::mutex> lk(state_mtx);
+              --active_count;
+              active_bytes -= need_bytes;
+            }
+            state_cv.notify_all();
+          });
+    } catch (...) {
+      // Enqueue failed (e.g. std::bad_alloc). Unwind the admission counters
+      // we just incremented and propagate as an internal error so the
+      // outer loop terminates cleanly.
+      std::lock_guard<std::mutex> lk(state_mtx);
+      --active_count;
+      active_bytes -= need_bytes;
+      if (first_error.ok()) {
+        first_error =
+            Status::InternalError("compact_dispatch_pool enqueue failed");
+      }
+      aborted = true;
+      state_cv.notify_all();
+      break;
     }
   }
 
+  // Wait for all dispatched tasks to drain (even on abort — we must not
+  // return while closures still reference our stack frame).
+  {
+    std::unique_lock<std::mutex> lk(state_mtx);
+    state_cv.wait(lk, [&] { return active_count == 0; });
+  }
+
+  if (!first_error.ok()) return first_error;
+  if (cancel && cancel->is_cancelled()) {
+    return Status::Cancelled("optimize cancelled");
+  }
   return Status::OK();
 }
 
@@ -1151,6 +1386,7 @@ Status CollectionImpl::AddColumn(const FieldSchema::Ptr &column_schema,
                                  const AddColumnOptions &options) {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
+  std::lock_guard<std::mutex> ddl_lock(ddl_mtx_);
   std::lock_guard lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
@@ -1223,6 +1459,7 @@ Status CollectionImpl::AddColumn(const FieldSchema::Ptr &column_schema,
 Status CollectionImpl::DropColumn(const std::string &column_name) {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
+  std::lock_guard<std::mutex> ddl_lock(ddl_mtx_);
   std::lock_guard lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
@@ -1297,6 +1534,7 @@ Status CollectionImpl::AlterColumn(const std::string &column_name,
                                    const AlterColumnOptions &options) {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
 
+  std::lock_guard<std::mutex> ddl_lock(ddl_mtx_);
   std::lock_guard lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);

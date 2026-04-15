@@ -59,6 +59,7 @@ from .model.doc import Doc
 from .model.param import (
     AddColumnOption,
     AlterColumnOption,
+    CancelToken,
     CollectionOption,
     FlatIndexParam,
     FtsIndexParam,
@@ -120,6 +121,7 @@ __all__ = [
     "HnswRabitqIndexParam",
     "FlatIndexParam",
     "IVFIndexParam",
+    "CancelToken",
     "CollectionOption",
     "IndexOption",
     "OptimizeOption",

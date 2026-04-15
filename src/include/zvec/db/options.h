@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <zvec/db/cancellation.h>
 
 namespace zvec {
 
@@ -55,7 +56,36 @@ struct CreateIndexOptions {
 };
 
 struct OptimizeOptions {
+  // Per-task inner parallelism (threads used inside a single compact/index
+  // build task). 0 = use GlobalConfig::optimize_thread_count default.
+  //
+  // This is the same knob that existed before Phase 1; kept first so that
+  // existing callers using `OptimizeOptions{N}` continue to compile and mean
+  // "N threads per task" unchanged.
   int concurrency_{0};
+
+  // Maximum number of compact/index tasks allowed to run concurrently.
+  // 0 = use GlobalConfig::compact_dispatch_thread_count default.
+  // A value of 1 restores the legacy sequential dispatch behaviour.
+  int parallel_tasks_{0};
+
+  // Soft memory budget, in bytes, for the whole Optimize call. The admission
+  // controller will not dispatch a new task if doing so would push the
+  // estimated concurrent peak RSS above this value. 0 = unlimited (bounded
+  // only by parallel_tasks_).
+  uint64_t memory_budget_bytes_{0};
+
+  // Per-input-doc memory estimate used by the admission controller. Each
+  // task's peak memory is estimated as
+  //     sum(input_segment.doc_count) * per_doc_memory_estimate_bytes_
+  // The default is a conservative 512 B/doc; override when profiling says
+  // otherwise.
+  uint64_t per_doc_memory_estimate_bytes_{512};
+
+  // Optional cooperative cancellation token. When set and signalled, the
+  // Optimize call returns Status::Cancelled at the next check point without
+  // applying partial results.
+  CancelToken::Ptr cancel_token_{nullptr};
 };
 
 struct AddColumnOptions {

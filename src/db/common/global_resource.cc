@@ -25,6 +25,8 @@ void GlobalResource::initialize() {
         new ailego::ThreadPool(GlobalConfig::Instance().query_thread_count()));
     this->optimize_thread_pool_.reset(new ailego::ThreadPool(
         GlobalConfig::Instance().optimize_thread_count()));
+    this->compact_dispatch_pool_.reset(new ailego::ThreadPool(
+        GlobalConfig::Instance().compact_dispatch_thread_count()));
     ailego::BufferManager::Instance().init(
         GlobalConfig::Instance().memory_limit_bytes(), 1);
   });

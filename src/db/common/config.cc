@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <zvec/db/config.h>
@@ -38,7 +39,14 @@ GlobalConfig::ConfigData::ConfigData()
       invert_to_forward_scan_ratio(0.9),
       brute_force_by_keys_ratio(0.1),
       max_query_topk(kMaxQueryTopk),
-      optimize_thread_count(CgroupUtil::getCpuLimit()) {}
+      optimize_thread_count(CgroupUtil::getCpuLimit()),
+      // Outer dispatch concurrency: half of CPU by default, at least 1, and
+      // capped so very large machines don't burn RSS on stalled optimises.
+      compact_dispatch_thread_count(
+          std::min<uint32_t>(16u,
+                             std::max<uint32_t>(1u,
+                                                CgroupUtil::getCpuLimit() /
+                                                    2u))) {}
 
 Status GlobalConfig::Validate(const ConfigData &config) const {
   if (config.memory_limit_bytes < MIN_MEMORY_LIMIT_BYTES) {
@@ -79,6 +87,12 @@ Status GlobalConfig::Validate(const ConfigData &config) const {
   if (config.optimize_thread_count == 0) {
     return Status::InvalidArgument(
         "optimize_thread_count must be greater than 0");
+  }
+
+  // Validate compact dispatch thread count
+  if (config.compact_dispatch_thread_count == 0) {
+    return Status::InvalidArgument(
+        "compact_dispatch_thread_count must be greater than 0");
   }
 
   // Validate log configuration
