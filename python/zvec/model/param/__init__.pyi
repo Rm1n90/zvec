@@ -30,6 +30,7 @@ __all__: list[str] = [
     "QueryParam",
     "SegmentOption",
     "VectorIndexParam",
+    "WalDurability",
 ]
 
 class AddColumnOption:
@@ -97,6 +98,24 @@ class AlterColumnOption:
         int: Number of threads used when altering a column (0 = auto).
         """
 
+class WalDurability:
+    """
+    Write-Ahead Log durability policy.
+
+    Members:
+        NONE: WAL records are written but never explicitly fsynced.
+        PER_BATCH: One fsync per write batch (default).
+        PER_DOC: fsync after every individual record.
+    """
+
+    NONE: typing.ClassVar[WalDurability]
+    PER_BATCH: typing.ClassVar[WalDurability]
+    PER_DOC: typing.ClassVar[WalDurability]
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+
 class CollectionOption:
     """
 
@@ -107,24 +126,27 @@ class CollectionOption:
             Default is False.
         enable_mmap (bool): Whether to use memory-mapped I/O for data files.
             Default is True.
+        max_buffer_size (int): Per-segment write-buffer size in bytes.
+            Default 64 MiB. Ignored when read_only=True.
+        wal_durability (WalDurability): WAL fsync policy. Default
+            PER_BATCH (one fsync per write call).
 
     Examples:
         >>> opt = CollectionOption(read_only=True, enable_mmap=False)
         >>> print(opt.read_only)
         True
+        >>> opt2 = CollectionOption(wal_durability=WalDurability.PER_DOC)
     """
 
     def __getstate__(self) -> tuple: ...
-    def __init__(self, read_only: bool = False, enable_mmap: bool = True) -> None:
-        """
-        Constructs a CollectionOption instance.
-
-        Args:
-            read_only (bool, optional): Open collection in read-only mode.
-                Defaults to False.
-            enable_mmap (bool, optional): Enable memory-mapped I/O.
-                Defaults to True.
-        """
+    def __init__(
+        self,
+        read_only: bool = False,
+        enable_mmap: bool = True,
+        max_buffer_size: typing.SupportsInt = 64 * 1024 * 1024,
+        wal_durability: WalDurability = ...,
+    ) -> None:
+        """Constructs a CollectionOption instance."""
 
     def __repr__(self) -> str: ...
     def __setstate__(self, arg0: tuple) -> None: ...
@@ -132,6 +154,10 @@ class CollectionOption:
     def enable_mmap(self) -> bool: ...
     @property
     def read_only(self) -> bool: ...
+    @property
+    def max_buffer_size(self) -> int: ...
+    @property
+    def wal_durability(self) -> WalDurability: ...
 
 class FlatIndexParam(VectorIndexParam):
     """

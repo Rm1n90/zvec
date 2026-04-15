@@ -33,18 +33,67 @@ int LocalWalFile::append(std::string &&data) {
       reinterpret_cast<const void *>(data.data()), record.length_, 0);
   record.content_ = std::forward<std::string>(data);
 
-  if (write_record(record) < 0) {
+  std::lock_guard<std::mutex> lock(file_mutex_);
+  if (write_record_locked(record) < 0) {
     WLOG_ERROR("Wal write record error. record.length_[%zu]",
                (size_t)record.length_);
     return -1;
   }
-  // if max_docs_wal_flush_ is 0, no need flush
-  if (max_docs_wal_flush_ != 0 && docs_count_ >= max_docs_wal_flush_) {
-    if (!file_.flush()) {
+
+  // Apply durability policy. PER_DOC fsyncs every single-doc append;
+  // PER_BATCH leaves the fsync to the batch-end caller; NONE never fsyncs
+  // here. The legacy counter-based trigger (max_docs_wal_flush_) is
+  // retained so callers that tuned it before Phase 2 keep their behaviour.
+  if (durability_ == WalDurability::PER_DOC) {
+    if (flush_locked() != 0) {
+      WLOG_ERROR("Wal flush error (PER_DOC).");
+      return -1;
+    }
+  } else if (max_docs_wal_flush_ != 0 &&
+             docs_count_ >= max_docs_wal_flush_) {
+    if (flush_locked() != 0) {
       WLOG_ERROR("Wal flush error. docs_count_[%zu] max_docs_wal_flush_[%zu]",
                  (size_t)docs_count_, (size_t)max_docs_wal_flush_);
     }
-    docs_count_ = 0;
+  }
+  return 0;
+}
+
+int LocalWalFile::append_batch(std::vector<std::string> records) {
+  if (records.empty()) return 0;
+
+  std::lock_guard<std::mutex> lock(file_mutex_);
+
+  for (auto &data : records) {
+    WalRecord record;
+    record.length_ = data.size();
+    record.crc_ = ailego::Crc32c::Hash(
+        reinterpret_cast<const void *>(data.data()), record.length_, 0);
+    record.content_ = std::move(data);
+
+    if (write_record_locked(record) < 0) {
+      WLOG_ERROR("Wal append_batch write error. record.length_[%zu]",
+                 (size_t)record.length_);
+      return -1;
+    }
+
+    // In PER_DOC mode, fsync after every record so each write is durable
+    // at the moment we observe success for it. The caller then sees the
+    // whole batch returned OK iff every per-record fsync succeeded.
+    if (durability_ == WalDurability::PER_DOC) {
+      if (flush_locked() != 0) {
+        WLOG_ERROR("Wal append_batch PER_DOC flush error.");
+        return -1;
+      }
+    }
+  }
+
+  // Single batch-end fsync for PER_BATCH. NONE skips fsync entirely.
+  if (durability_ == WalDurability::PER_BATCH) {
+    if (flush_locked() != 0) {
+      WLOG_ERROR("Wal append_batch PER_BATCH flush error.");
+      return -1;
+    }
   }
   return 0;
 }
@@ -106,6 +155,7 @@ int LocalWalFile::open(const WalOptions &wal_option) {
   }
 
   max_docs_wal_flush_ = wal_option.max_docs_wal_flush;
+  durability_ = wal_option.durability;
   opened_ = true;
 
   WLOG_INFO("Wal open success. create_new[%d]", wal_option.create_new);
@@ -133,10 +183,17 @@ int LocalWalFile::remove() {
 
 int LocalWalFile::flush() {
   CHECK_STATUS(opened_, true);
+  std::lock_guard<std::mutex> lock(file_mutex_);
+  return flush_locked();
+}
+
+// Caller holds file_mutex_. Keeps docs_count_ bookkeeping consistent with
+// the legacy max_docs_wal_flush_ trigger.
+int LocalWalFile::flush_locked() {
   if (!file_.flush()) {
-    WLOG_ERROR("Wal flush error.");
     return -1;
   }
+  docs_count_ = 0;
   return 0;
 }
 
@@ -157,41 +214,43 @@ int LocalWalFile::prepare_for_read() {
   return 0;
 }
 
-//! Return 1 if success or -1 if write error
-int LocalWalFile::write_record(WalRecord &record) {
+//! Return 1 if success or -1 if write error. Caller holds file_mutex_.
+int LocalWalFile::write_record_locked(WalRecord &record) {
   CHECK_STATUS(opened_, true);
 
   int write_size = 0;
-  int ret = -1;
 
+  write_size = file_.write((const void *)&record.length_, LENGTH_SIZE);
+  if (write_size != LENGTH_SIZE) {
+    WLOG_ERROR("Wal write error. record.length_ error write_size[%d]",
+               write_size);
+    return -1;
+  }
+
+  write_size = file_.write((const void *)&record.crc_, CRC_SIZE);
+  if (write_size != CRC_SIZE) {
+    WLOG_ERROR("Wal write error. record.crc_ error write_size[%d]",
+               write_size);
+    return -1;
+  }
+
+  write_size =
+      file_.write((const void *)record.content_.data(), record.length_);
+  if (write_size != (int)record.length_) {
+    WLOG_ERROR("Wal write error. record.content_ error write_size[%d]",
+               write_size);
+    return -1;
+  }
+  docs_count_++;
+  return 1;
+}
+
+// Preserved for callers outside the batch path (none currently, but the
+// declaration lives in local_wal_file.h so keep a working implementation
+// for any future single-caller uses and for symmetry with read_record()).
+int LocalWalFile::write_record(WalRecord &record) {
   std::lock_guard<std::mutex> lock(file_mutex_);
-  do {
-    write_size = file_.write((const void *)&record.length_, LENGTH_SIZE);
-    if (write_size != LENGTH_SIZE) {
-      WLOG_ERROR("Wal write error. record.length_ error write_size[%d]",
-                 write_size);
-      break;
-    }
-
-    write_size = file_.write((const void *)&record.crc_, CRC_SIZE);
-    if (write_size != CRC_SIZE) {
-      WLOG_ERROR("Wal write error. record.crc_ error write_size[%d]",
-                 write_size);
-      break;
-    }
-
-    write_size =
-        file_.write((const void *)record.content_.data(), record.length_);
-    if (write_size != (int)record.length_) {
-      WLOG_ERROR("Wal write error. record.content_ error write_size[%d]",
-                 write_size);
-      break;
-    }
-    ret = 1;  // write one record success
-    docs_count_++;
-  } while (false);
-
-  return ret;
+  return write_record_locked(record);
 }
 
 //! Return 1 if success or 0 if eof or -1 if read error

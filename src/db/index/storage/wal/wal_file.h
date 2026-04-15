@@ -15,6 +15,8 @@
 
 #include <memory>
 #include <string>
+#include <vector>
+#include <zvec/db/options.h>
 
 
 namespace zvec {
@@ -24,8 +26,16 @@ class WalFile;
 using WalFilePtr = std::shared_ptr<WalFile>;
 
 struct WalOptions {
+  // Legacy knob: auto-fsync after this many `append()` calls accumulate.
+  // 0 disables this counter-based trigger. Kept for back-compat; the
+  // high-level `durability` field below is the primary control now.
   uint32_t max_docs_wal_flush{0};
   bool create_new{false};
+  // Fsync policy for this WAL. See WalDurability docs in
+  // include/zvec/db/options.h. Default PER_BATCH means the caller is
+  // expected to drive fsync via `append_batch` / end-of-batch `flush`;
+  // per-call `append()` will not fsync under PER_BATCH.
+  WalDurability durability{WalDurability::PER_BATCH};
 };
 
 class WalFile {
@@ -45,6 +55,18 @@ class WalFile {
 
  public:
   virtual int append(std::string &&data) = 0;
+
+  // Append many records with group-commit semantics. Writes all records
+  // to the underlying file under a single lock, then fsyncs once or N
+  // times according to the active WalDurability:
+  //   NONE      — no fsync (OS flushes when it wants)
+  //   PER_BATCH — one fsync after all records are written
+  //   PER_DOC   — fsync after each record
+  // Returns 0 on success, non-zero on any write/fsync error. On failure
+  // the WAL file may contain a prefix of the records; replay is tolerant
+  // of torn writes at the tail because each record carries a CRC.
+  virtual int append_batch(std::vector<std::string> records) = 0;
+
   virtual int prepare_for_read() = 0;
   virtual std::string next() = 0;
 

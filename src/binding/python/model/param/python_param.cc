@@ -961,6 +961,25 @@ Args:
 }
 
 void ZVecPyParams::bind_options(py::module_ &m) {  // binding collection options
+  // WalDurability enum — Phase 2 of the optimization pipeline.
+  py::enum_<WalDurability>(m, "WalDurability", R"pbdoc(
+Write-Ahead Log durability policy. Higher durability trades throughput
+for crash-safety.
+
+Members:
+    NONE      — WAL records are written but never explicitly fsynced;
+                the OS flushes eventually. Fastest mode; use only when
+                the collection is rebuildable from another source of
+                truth.
+    PER_BATCH — One fsync per write batch (default). All records in
+                the batch are durable on disk before the call returns.
+    PER_DOC   — fsync after every individual record. Strongest
+                durability and slowest.
+)pbdoc")
+      .value("NONE", WalDurability::NONE)
+      .value("PER_BATCH", WalDurability::PER_BATCH)
+      .value("PER_DOC", WalDurability::PER_DOC);
+
   py::class_<CollectionOptions>(m, "CollectionOption", R"pbdoc(
 Options for opening or creating a collection.
 
@@ -969,14 +988,30 @@ Attributes:
         Default is False.
     enable_mmap (bool): Whether to use memory-mapped I/O for data files.
         Default is True.
+    max_buffer_size (int): In-memory write buffer size per writing
+        segment, in bytes. Default 64 MiB. Ignored when read_only=True.
+    wal_durability (WalDurability): WAL fsync policy. Default
+        PER_BATCH (one fsync per write call).
 
 Examples:
     >>> opt = CollectionOption(read_only=True, enable_mmap=False)
     >>> print(opt.read_only)
     True
+    >>> opt2 = CollectionOption(wal_durability=WalDurability.PER_DOC)
 )pbdoc")
-      .def(py::init<bool, bool>(), py::arg("read_only") = false,
-           py::arg("enable_mmap") = true,
+      .def(py::init([](bool read_only, bool enable_mmap,
+                       uint32_t max_buffer_size,
+                       WalDurability wal_durability) {
+             CollectionOptions o;
+             o.read_only_ = read_only;
+             o.enable_mmap_ = enable_mmap;
+             o.max_buffer_size_ = max_buffer_size;
+             o.wal_durability_ = wal_durability;
+             return o;
+           }),
+           py::arg("read_only") = false, py::arg("enable_mmap") = true,
+           py::arg("max_buffer_size") = DEFAULT_MAX_BUFFER_SIZE,
+           py::arg("wal_durability") = WalDurability::PER_BATCH,
            R"pbdoc(
 Constructs a CollectionOption instance.
 
@@ -985,6 +1020,10 @@ Args:
         Defaults to False.
     enable_mmap (bool, optional): Enable memory-mapped I/O.
         Defaults to True.
+    max_buffer_size (int, optional): Per-segment write-buffer size in
+        bytes. Defaults to 64 MiB.
+    wal_durability (WalDurability, optional): WAL fsync policy.
+        Defaults to PER_BATCH.
 )pbdoc")
       .def_property_readonly(
           "enable_mmap",
@@ -992,26 +1031,48 @@ Args:
       .def_property_readonly(
           "read_only",
           [](const CollectionOptions &self) { return self.read_only_; })
+      .def_property_readonly(
+          "max_buffer_size",
+          [](const CollectionOptions &self) { return self.max_buffer_size_; })
+      .def_property_readonly(
+          "wal_durability",
+          [](const CollectionOptions &self) { return self.wal_durability_; })
       .def("__repr__",
            [](const CollectionOptions &self) -> std::string {
              return "{"
                     "\"enable_mmap\":" +
                     std::to_string(self.enable_mmap_) +
-                    ", \"read_only\":" + std::to_string(self.read_only_) + "}";
+                    ", \"read_only\":" + std::to_string(self.read_only_) +
+                    ", \"max_buffer_size\":" +
+                    std::to_string(self.max_buffer_size_) +
+                    ", \"wal_durability\":" +
+                    std::to_string(static_cast<int>(self.wal_durability_)) +
+                    "}";
            })
       .def(py::pickle(
           [](const CollectionOptions &self) {
             return py::make_tuple(self.read_only_, self.enable_mmap_,
-                                  self.max_buffer_size_);
+                                  self.max_buffer_size_,
+                                  static_cast<uint8_t>(self.wal_durability_));
           },
           [](py::tuple t) {
-            if (t.size() != 3)
+            // Accept the pre-Phase-2 3-tuple and the new 4-tuple so
+            // older pickled options continue to load.
+            CollectionOptions obj{};
+            if (t.size() == 3) {
+              obj.read_only_ = t[0].cast<bool>();
+              obj.enable_mmap_ = t[1].cast<bool>();
+              obj.max_buffer_size_ = t[2].cast<uint32_t>();
+            } else if (t.size() == 4) {
+              obj.read_only_ = t[0].cast<bool>();
+              obj.enable_mmap_ = t[1].cast<bool>();
+              obj.max_buffer_size_ = t[2].cast<uint32_t>();
+              obj.wal_durability_ =
+                  static_cast<WalDurability>(t[3].cast<uint8_t>());
+            } else {
               throw std::runtime_error(
                   "Invalid pickle data for CollectionOptions");
-            CollectionOptions obj{};
-            obj.read_only_ = t[0].cast<bool>();
-            obj.enable_mmap_ = t[1].cast<bool>();
-            obj.max_buffer_size_ = t[2].cast<uint32_t>();
+            }
             return obj;
           }));
 

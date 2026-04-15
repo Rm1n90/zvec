@@ -138,6 +138,22 @@ class Segment {
 
   virtual Status Delete(uint64_t g_doc_id) = 0;
 
+  // Batched variants with group-commit WAL semantics. The WAL is fsynced
+  // once at the end of the batch according to the collection's
+  // WalDurability setting (PER_BATCH = one fsync per call, PER_DOC =
+  // fsync after each record, NONE = no explicit fsync). Returns a
+  // per-doc status vector in input order; a mix of OK and error is
+  // normal (e.g. duplicate-pk errors in Insert). Returns a Status-level
+  // error iff the batch-end fsync itself fails.
+  virtual Result<WriteResults> InsertBatch(std::vector<Doc> &docs) = 0;
+
+  virtual Result<WriteResults> UpsertBatch(std::vector<Doc> &docs) = 0;
+
+  virtual Result<WriteResults> UpdateBatch(std::vector<Doc> &docs) = 0;
+
+  virtual Result<WriteResults> DeleteBatch(
+      const std::vector<std::string> &pks) = 0;
+
   virtual Doc::Ptr Fetch(uint64_t g_doc_id) = 0;
 
   // for sqlengine

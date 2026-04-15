@@ -30,6 +30,7 @@ from _zvec.param import (
     IVFQueryParam,
     MatchOp,
     OptimizeOption,
+    WalDurability,
 )
 
 __all__ = [
@@ -49,4 +50,5 @@ __all__ = [
     "InvertIndexParam",
     "MatchOp",
     "OptimizeOption",
+    "WalDurability",
 ]

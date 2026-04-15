@@ -60,6 +60,7 @@ class LocalWalFile : public WalFile {
 
  public:
   int append(std::string &&data) override;
+  int append_batch(std::vector<std::string> records) override;
   int prepare_for_read() override;
   std::string next() override;
 
@@ -77,6 +78,11 @@ class LocalWalFile : public WalFile {
   }
 
  private:
+  // Locked variants — caller must hold file_mutex_. Used by append_batch()
+  // to avoid re-acquiring the mutex per record.
+  int write_record_locked(WalRecord &record);
+  int flush_locked();
+
   int write_record(WalRecord &record);
   int read_record(WalRecord &record);
 
@@ -89,6 +95,7 @@ class LocalWalFile : public WalFile {
   std::string wal_path_{};
   std::mutex file_mutex_;
   uint32_t max_docs_wal_flush_{0};
+  WalDurability durability_{WalDurability::PER_BATCH};
   std::atomic<uint64_t> docs_count_{0UL};
   WalHeader header_;
 

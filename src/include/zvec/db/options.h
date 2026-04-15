@@ -20,16 +20,44 @@ namespace zvec {
 
 const uint32_t DEFAULT_MAX_BUFFER_SIZE = 64 * 1024 * 1024;  // 128M
 
+// Write-Ahead Log durability policy.
+//
+// Controls when WAL records reach stable storage (fsync). Higher durability
+// trades throughput for crash-safety.
+//
+//   NONE      — WAL records reach the OS page cache on write but are never
+//               explicitly fsynced; the OS flushes them eventually or on
+//               normal close. Crash before that window loses recent writes.
+//               Fastest mode; use only when the collection is rebuildable
+//               from an upstream source of truth.
+//
+//   PER_BATCH — One fsync per write batch (default). A batch is a single
+//               Insert/Upsert/Update/Delete call from the caller. All
+//               records in the batch are durably on disk before the call
+//               returns OK. Group-commit fsync amortises cost across the
+//               batch.
+//
+//   PER_DOC   — fsync after every individual record. Strongest durability
+//               and slowest; use when each single write must survive a
+//               crash even if the enclosing batch is mid-flight.
+enum class WalDurability : uint8_t {
+  NONE = 0,
+  PER_BATCH = 1,
+  PER_DOC = 2,
+};
+
 struct CollectionOptions {
   bool read_only_{false};
   bool enable_mmap_{true};  // ignnored when load collection
   uint32_t max_buffer_size_{
       DEFAULT_MAX_BUFFER_SIZE};  // ignored when read_only=true
+  WalDurability wal_durability_{WalDurability::PER_BATCH};
 
   bool operator==(const CollectionOptions &other) const {
     return read_only_ == other.read_only_ &&
            enable_mmap_ == other.enable_mmap_ &&
-           max_buffer_size_ == other.max_buffer_size_;
+           max_buffer_size_ == other.max_buffer_size_ &&
+           wal_durability_ == other.wal_durability_;
   }
 
   bool operator!=(const CollectionOptions &other) const {
@@ -39,16 +67,19 @@ struct CollectionOptions {
   CollectionOptions() = default;
 
   CollectionOptions(bool read_only, bool enable_mmap,
-                    uint32_t max_buffer_size = DEFAULT_MAX_BUFFER_SIZE)
+                    uint32_t max_buffer_size = DEFAULT_MAX_BUFFER_SIZE,
+                    WalDurability wal_durability = WalDurability::PER_BATCH)
       : read_only_(read_only),
         enable_mmap_(enable_mmap),
-        max_buffer_size_(max_buffer_size) {}
+        max_buffer_size_(max_buffer_size),
+        wal_durability_(wal_durability) {}
 };
 
 struct SegmentOptions {
   bool read_only_;
   bool enable_mmap_;
   uint32_t max_buffer_size_{DEFAULT_MAX_BUFFER_SIZE};
+  WalDurability wal_durability_{WalDurability::PER_BATCH};
 };
 
 struct CreateIndexOptions {

@@ -133,6 +133,15 @@ class SegmentImpl : public Segment,
 
   Status Delete(uint64_t g_doc_id) override;
 
+  Result<WriteResults> InsertBatch(std::vector<Doc> &docs) override;
+
+  Result<WriteResults> UpsertBatch(std::vector<Doc> &docs) override;
+
+  Result<WriteResults> UpdateBatch(std::vector<Doc> &docs) override;
+
+  Result<WriteResults> DeleteBatch(
+      const std::vector<std::string> &pks) override;
+
   Doc::Ptr Fetch(uint64_t g_doc_id) override;
 
   CombinedVectorColumnIndexer::Ptr get_combined_vector_indexer(
@@ -990,6 +999,161 @@ Status SegmentImpl::Delete(uint64_t g_doc_id) {
   auto s = append_wal(mutable_doc);
   CHECK_RETURN_STATUS(s);
   return internal_delete(mutable_doc);
+}
+
+// ===========================================================================
+// Batched write path — Phase 2 of the optimization pipeline.
+//
+// These methods take seg_mtx_ once for the whole batch, interleave
+// per-doc append_wal (which writes to the OS page cache under
+// PER_BATCH and NONE, or fsyncs per-doc under PER_DOC) with per-doc
+// internal state changes, then issue a single group-commit fsync at the
+// end when the durability mode is PER_BATCH. The per-doc ordering of
+// "WAL record written before internal state change" is preserved so
+// crash recovery remains correct.
+// ===========================================================================
+
+Result<WriteResults> SegmentImpl::InsertBatch(std::vector<Doc> &docs) {
+  std::lock_guard lock(seg_mtx_);
+
+  WriteResults results;
+  results.reserve(docs.size());
+
+  for (auto &doc : docs) {
+    if (id_map_ && id_map_->has(doc.pk())) {
+      results.push_back(Status::AlreadyExists("insert failed: doc_id[",
+                                              doc.pk(),
+                                              "] already exists in collection"));
+      continue;
+    }
+
+    doc.set_operator(Operator::INSERT);
+
+    auto s = append_wal(doc);
+    if (!s.ok()) {
+      results.push_back(s);
+      continue;
+    }
+
+    results.push_back(internal_insert(doc));
+  }
+
+  if (options_.wal_durability_ == WalDurability::PER_BATCH && wal_file_) {
+    if (wal_file_->flush() != 0) {
+      return tl::make_unexpected(
+          Status::InternalError("WAL fsync failed at end of Insert batch"));
+    }
+  }
+
+  return results;
+}
+
+Result<WriteResults> SegmentImpl::UpsertBatch(std::vector<Doc> &docs) {
+  std::lock_guard lock(seg_mtx_);
+
+  WriteResults results;
+  results.reserve(docs.size());
+
+  for (auto &doc : docs) {
+    doc.set_operator(Operator::UPSERT);
+
+    auto s = append_wal(doc);
+    if (!s.ok()) {
+      results.push_back(s);
+      continue;
+    }
+
+    results.push_back(internal_upsert(doc));
+  }
+
+  if (options_.wal_durability_ == WalDurability::PER_BATCH && wal_file_) {
+    if (wal_file_->flush() != 0) {
+      return tl::make_unexpected(
+          Status::InternalError("WAL fsync failed at end of Upsert batch"));
+    }
+  }
+
+  return results;
+}
+
+Result<WriteResults> SegmentImpl::UpdateBatch(std::vector<Doc> &docs) {
+  std::lock_guard lock(seg_mtx_);
+
+  WriteResults results;
+  results.reserve(docs.size());
+
+  for (auto &doc : docs) {
+    uint64_t g_doc_id;
+    if (!id_map_->has(doc.pk(), &g_doc_id)) {
+      results.push_back(Status::NotFound("update failed: doc_id[", doc.pk(),
+                                         "] not found in collection"));
+      continue;
+    }
+
+    doc.set_doc_id(g_doc_id);
+    doc.set_operator(Operator::UPDATE);
+
+    auto s = append_wal(doc);
+    if (!s.ok()) {
+      results.push_back(s);
+      continue;
+    }
+
+    results.push_back(internal_update(doc));
+  }
+
+  if (options_.wal_durability_ == WalDurability::PER_BATCH && wal_file_) {
+    if (wal_file_->flush() != 0) {
+      return tl::make_unexpected(
+          Status::InternalError("WAL fsync failed at end of Update batch"));
+    }
+  }
+
+  return results;
+}
+
+Result<WriteResults> SegmentImpl::DeleteBatch(
+    const std::vector<std::string> &pks) {
+  std::lock_guard lock(seg_mtx_);
+
+  WriteResults results;
+  results.reserve(pks.size());
+
+  for (auto &pk : pks) {
+    uint64_t g_doc_id;
+    if (!id_map_->has(pk, &g_doc_id)) {
+      results.push_back(Status::NotFound("primary key: ", pk, " not found"));
+      continue;
+    }
+    if (delete_store_->is_deleted(g_doc_id)) {
+      results.push_back(Status::NotFound("primary key: ", pk,
+                                         " g_doc_id: ", g_doc_id,
+                                         " already deleted"));
+      continue;
+    }
+
+    Doc mutable_doc;
+    mutable_doc.set_pk(pk);
+    mutable_doc.set_doc_id(g_doc_id);
+    mutable_doc.set_operator(Operator::DELETE);
+
+    auto s = append_wal(mutable_doc);
+    if (!s.ok()) {
+      results.push_back(s);
+      continue;
+    }
+
+    results.push_back(internal_delete(mutable_doc));
+  }
+
+  if (options_.wal_durability_ == WalDurability::PER_BATCH && wal_file_) {
+    if (wal_file_->flush() != 0) {
+      return tl::make_unexpected(
+          Status::InternalError("WAL fsync failed at end of Delete batch"));
+    }
+  }
+
+  return results;
 }
 
 template <typename T>
@@ -4410,6 +4574,7 @@ Status SegmentImpl::open_wal_file() {
   } else {
     wal_option.create_new = true;
   }
+  wal_option.durability = options_.wal_durability_;
 
   if (WalFile::CreateAndOpen(wal_file_path, wal_option, &wal_file_) != 0) {
     LOG_ERROR("WAL open failed: unable to create/open WAL file [%s]",

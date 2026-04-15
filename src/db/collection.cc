@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <shared_mutex>
 #include <string>
 #include <unordered_set>
@@ -501,7 +502,8 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
     CHECK_RETURN_STATUS(s);
 
     auto seg_options =
-        SegmentOptions{false, options_.enable_mmap_, options_.max_buffer_size_};
+        SegmentOptions{false, options_.enable_mmap_, options_.max_buffer_size_,
+                       options_.wal_durability_};
     auto new_segment = Segment::CreateAndOpen(
         path_, *new_schema, allocate_segment_id(),
         writing_segment_->meta()->max_doc_id() + 1, id_map_, delete_store_,
@@ -528,6 +530,7 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
     seg_options.enable_mmap_ = options_.enable_mmap_;
     seg_options.max_buffer_size_ = options_.max_buffer_size_;
     seg_options.read_only_ = options_.read_only_;
+    seg_options.wal_durability_ = options_.wal_durability_;
     auto writing_segment =
         Segment::CreateAndOpen(path_, *new_schema, id, min_doc_id, id_map_,
                                delete_store_, version_manager_, seg_options);
@@ -696,7 +699,8 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
                                writing_segment_->meta()->max_doc_id() + 1,
                                id_map_, delete_store_, version_manager_,
                                SegmentOptions{false, options_.enable_mmap_,
-                                              options_.max_buffer_size_});
+                                              options_.max_buffer_size_,
+                                              options_.wal_durability_});
     if (!new_segment) {
       return new_segment.error();
     }
@@ -718,6 +722,7 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
     seg_options.enable_mmap_ = options_.enable_mmap_;
     seg_options.max_buffer_size_ = options_.max_buffer_size_;
     seg_options.read_only_ = options_.read_only_;
+    seg_options.wal_durability_ = options_.wal_durability_;
     auto writing_segment =
         Segment::CreateAndOpen(path_, *new_schema, id, min_doc_id, id_map_,
                                delete_store_, version_manager_, seg_options);
@@ -1426,6 +1431,7 @@ Status CollectionImpl::AddColumn(const FieldSchema::Ptr &column_schema,
   seg_options.enable_mmap_ = options_.enable_mmap_;
   seg_options.max_buffer_size_ = options_.max_buffer_size_;
   seg_options.read_only_ = options_.read_only_;
+  seg_options.wal_durability_ = options_.wal_durability_;
   auto writing_segment =
       Segment::CreateAndOpen(path_, *new_schema, id, min_doc_id, id_map_,
                              delete_store_, version_manager_, seg_options);
@@ -1498,6 +1504,7 @@ Status CollectionImpl::DropColumn(const std::string &column_name) {
   seg_options.enable_mmap_ = options_.enable_mmap_;
   seg_options.max_buffer_size_ = options_.max_buffer_size_;
   seg_options.read_only_ = options_.read_only_;
+  seg_options.wal_durability_ = options_.wal_durability_;
   auto writing_segment =
       Segment::CreateAndOpen(path_, *new_schema, id, min_doc_id, id_map_,
                              delete_store_, version_manager_, seg_options);
@@ -1584,6 +1591,7 @@ Status CollectionImpl::AlterColumn(const std::string &column_name,
   seg_options.enable_mmap_ = options_.enable_mmap_;
   seg_options.max_buffer_size_ = options_.max_buffer_size_;
   seg_options.read_only_ = options_.read_only_;
+  seg_options.wal_durability_ = options_.wal_durability_;
   auto writing_segment =
       Segment::CreateAndOpen(path_, *new_schema, id, min_doc_id, id_map_,
                              delete_store_, version_manager_, seg_options);
@@ -1686,38 +1694,83 @@ Result<WriteResults> CollectionImpl::write_impl(std::vector<Doc> &docs,
   // TODO: The granularity of the write_lock is too coarse.
   std::lock_guard write_lock(write_mtx_);
 
-  WriteResults results;
-  // validate write batch size
   if (docs.size() > kMaxWriteBatchSize) {
-    CHECK_RETURN_STATUS_EXPECTED(Status::InvalidArgument(
-        "Too many docs: ", docs.size(), " exceeds max write batch size of ",
-        kMaxWriteBatchSize));
+    return tl::make_unexpected(Status::InvalidArgument(
+        "Too many docs: ", docs.size(),
+        " exceeds max write batch size of ", kMaxWriteBatchSize));
   }
 
-  // validate docs
-  for (auto &&doc : docs) {
-    if (need_switch_to_new_segment()) {
-      auto s = switch_to_new_segment_for_writing();
-      CHECK_RETURN_STATUS_EXPECTED(s);
+  // Output vector pre-sized so pre-merge errors and batch results land at
+  // their input indices. Statuses default-construct to OK and are
+  // overwritten below.
+  WriteResults results(docs.size());
+
+  // Build the working batch:
+  //   INSERT/UPSERT — docs[] is the working batch unchanged.
+  //   UPDATE        — fetch the existing doc per pk and merge in the
+  //                   caller-supplied fields. Per-doc fetch errors land
+  //                   in results[] at the input index; only successfully
+  //                   merged docs go into the batch dispatch below.
+  std::vector<Doc> merged_docs;
+  std::vector<Doc> *working_docs;
+  std::vector<size_t> working_to_input_idx;
+
+  if (mode == WriteMode::UPDATE) {
+    merged_docs.reserve(docs.size());
+    working_to_input_idx.reserve(docs.size());
+    for (size_t i = 0; i < docs.size(); ++i) {
+      Doc::Ptr old_doc{nullptr};
+      auto fetch_status = internal_fetch_by_doc(docs[i], &old_doc);
+      if (!fetch_status.ok()) {
+        results[i] = fetch_status;
+        continue;
+      }
+      old_doc->merge(docs[i]);
+      merged_docs.push_back(*old_doc);
+      working_to_input_idx.push_back(i);
     }
+    working_docs = &merged_docs;
+  } else {
+    working_to_input_idx.resize(docs.size());
+    std::iota(working_to_input_idx.begin(), working_to_input_idx.end(), 0);
+    working_docs = &docs;
+  }
 
-    Status s;
+  if (working_docs->empty()) return results;
 
-    switch (mode) {
-      case WriteMode::UPSERT:
-        s = handle_upsert(doc);
-        break;
-      case WriteMode::UPDATE:
-        s = handle_update(doc);
-        break;
-      case WriteMode::INSERT:
-        s = handle_insert(doc);
-        break;
-      default:
-        s = Status::InvalidArgument("Invalid write mode");
-    }
+  // Rotate the writing segment if it's already at capacity. We do not
+  // chunk the batch across segments — the segment may temporarily exceed
+  // schema_->max_doc_count_per_segment(); the next write call performs
+  // the rotation. The legacy per-doc loop only rotated *between* docs
+  // for the same reason, so this preserves the existing
+  // grow-then-rotate behaviour for batches that overflow remaining
+  // capacity.
+  if (need_switch_to_new_segment()) {
+    auto s = switch_to_new_segment_for_writing();
+    CHECK_RETURN_STATUS_EXPECTED(s);
+  }
 
-    results.push_back(s);
+  Result<WriteResults> batch_results;
+  switch (mode) {
+    case WriteMode::INSERT:
+      batch_results = writing_segment_->InsertBatch(*working_docs);
+      break;
+    case WriteMode::UPSERT:
+      batch_results = writing_segment_->UpsertBatch(*working_docs);
+      break;
+    case WriteMode::UPDATE:
+      batch_results = writing_segment_->UpdateBatch(*working_docs);
+      break;
+    default:
+      return tl::make_unexpected(
+          Status::InvalidArgument("Invalid write mode"));
+  }
+  if (!batch_results.has_value()) {
+    return batch_results;
+  }
+
+  for (size_t bi = 0; bi < batch_results.value().size(); ++bi) {
+    results[working_to_input_idx[bi]] = std::move(batch_results.value()[bi]);
   }
 
   return results;
@@ -1741,7 +1794,8 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
       path_, schema == nullptr ? *schema_ : *schema, allocate_segment_id(),
       writing_segment_->meta()->max_doc_id() + 1, id_map_, delete_store_,
       version_manager_,
-      SegmentOptions{false, options_.enable_mmap_, options_.max_buffer_size_});
+      SegmentOptions{false, options_.enable_mmap_, options_.max_buffer_size_,
+                     options_.wal_durability_});
   if (!new_segment) {
     return new_segment.error();
   }
@@ -1774,13 +1828,11 @@ Result<WriteResults> CollectionImpl::Delete(
 
   // TODO: The granularity of the write_lock is too coarse.
   std::lock_guard write_lock(write_mtx_);
-  WriteResults results;
-  for (auto &&pk : pks) {
-    Status s = writing_segment_->Delete(pk);
-    results.push_back(s);
-  }
 
-  return results;
+  // Group-commit batched delete via the segment's DeleteBatch path: one
+  // seg_mtx_ acquisition for the whole batch, one WAL group-commit
+  // fsync at the end (under PER_BATCH durability).
+  return writing_segment_->DeleteBatch(pks);
 }
 
 Status CollectionImpl::DeleteByFilter(const std::string &filter) {

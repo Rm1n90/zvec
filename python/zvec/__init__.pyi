@@ -29,6 +29,7 @@ from .model.param import (
     IVFQueryParam,
     MatchOp,
     OptimizeOption,
+    WalDurability,
 )
 from .model.param.text_query import TextQuery
 from .model.param.vector_query import VectorQuery
@@ -83,6 +84,7 @@ __all__: list = [
     "TextQuery",
     "VectorQuery",
     "VectorSchema",
+    "WalDurability",
     "WeightedReRanker",
     "create_and_open",
     "init",
