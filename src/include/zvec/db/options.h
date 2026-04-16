@@ -60,6 +60,24 @@ struct CollectionOptions {
   // pick a value that matches your expected concurrent writer count.
   uint32_t write_shards_{1};
 
+  // Phase 6: background auto-optimize. When enabled, a dedicated
+  // thread periodically checks whether the collection has accumulated
+  // enough persisted segments to warrant an Optimize call, and
+  // triggers one automatically. Manual Optimize() remains available.
+  // Ignored when read_only_ is true.
+  bool auto_optimize_enabled_{false};
+  // How often (seconds) the background thread checks the trigger
+  // condition. Shorter intervals make the optimizer more responsive
+  // but add a small CPU-wake cost. Default 60 s.
+  uint32_t auto_optimize_interval_seconds_{60};
+  // Threshold: trigger optimize when the persisted segment count
+  // exceeds this value. Default 10.
+  uint32_t auto_optimize_max_segments_{10};
+  // Minimum cool-down (seconds) between consecutive auto-optimize
+  // runs. Prevents rapid re-triggering when the segment count stays
+  // above threshold briefly after a run. Default 300 s (5 min).
+  uint32_t auto_optimize_cooldown_seconds_{300};
+
   bool operator==(const CollectionOptions &other) const {
     return read_only_ == other.read_only_ &&
            enable_mmap_ == other.enable_mmap_ &&

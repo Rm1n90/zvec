@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -21,6 +22,7 @@
 #include <numeric>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -150,6 +152,11 @@ class CollectionImpl : public Collection {
   Status init_version_manager();
 
   Status init_writing_segment();
+
+  // Phase 6: auto-optimize lifecycle.
+  void start_auto_optimize();
+  void stop_auto_optimize();
+  void auto_optimize_loop();
 
   bool need_switch_to_new_segment() const;
   bool need_switch_to_new_segment(size_t shard) const;
@@ -336,6 +343,12 @@ class CollectionImpl : public Collection {
   // file lock
   ailego::File lock_file_;
 
+  // Phase 6: background auto-optimize thread.
+  std::thread auto_optimize_thread_;
+  std::atomic<bool> auto_optimize_stop_{true};
+  std::mutex auto_optimize_mtx_;
+  std::condition_variable auto_optimize_cv_;
+
   IDMap::Ptr id_map_;
   DeleteStore::Ptr delete_store_;
 
@@ -408,11 +421,19 @@ Status CollectionImpl::Open(const CollectionOptions &options) {
   auto profiler = std::make_shared<Profiler>();
   sql_engine_ = sqlengine::SQLEngine::create(profiler);
 
+  if (s.ok()) {
+    start_auto_optimize();
+  }
+
   return s;
 }
 
 Status CollectionImpl::Close() {
-  // only called in deconstructor
+  // Stop the auto-optimize thread BEFORE acquiring schema_handle_mtx_
+  // so we don't deadlock if Optimize is in-flight (Optimize holds
+  // ddl_mtx_ + schema_handle_mtx_ during quiesce/commit).
+  stop_auto_optimize();
+
   std::lock_guard lock(schema_handle_mtx_);
 
   CHECK_DESTROY_RETURN_STATUS(destroyed_, false);
@@ -961,9 +982,16 @@ Status CollectionImpl::Optimize(const OptimizeOptions &options) {
     std::shared_lock<std::shared_mutex> schema_lock(schema_handle_mtx_);
     std::lock_guard<std::shared_mutex> write_lock(write_mtx_);
 
-    if (writing_segments_[0]->doc_count() != 0) {
-      auto s = switch_to_new_segment_for_writing();
-      if (!s.ok()) return s;
+    // Force-rotate every non-empty shard's writing segment into a
+    // persisted segment. This is NOT the capacity-gated rotation
+    // from write_impl (which only rotates at max_doc_count) — Optimize
+    // must flush ALL pending writes so the compact phase sees the full
+    // data set.
+    for (size_t shard = 0; shard < writing_segments_.size(); ++shard) {
+      if (writing_segments_[shard]->doc_count() != 0) {
+        auto s = switch_to_new_segment_for_writing(shard);
+        if (!s.ok()) return s;
+      }
     }
 
     persist_segments = get_all_persist_segments();
@@ -2531,6 +2559,82 @@ std::vector<Segment::Ptr> CollectionImpl::get_all_segments() const {
 
 std::vector<Segment::Ptr> CollectionImpl::get_all_persist_segments() const {
   return segment_manager_->get_segments();
+}
+
+// ===========================================================================
+// Phase 6 — background auto-optimize
+// ===========================================================================
+
+void CollectionImpl::start_auto_optimize() {
+  if (!options_.auto_optimize_enabled_ || options_.read_only_) return;
+
+  auto_optimize_stop_.store(false);
+  auto_optimize_thread_ =
+      std::thread(&CollectionImpl::auto_optimize_loop, this);
+}
+
+void CollectionImpl::stop_auto_optimize() {
+  {
+    std::lock_guard<std::mutex> lk(auto_optimize_mtx_);
+    auto_optimize_stop_.store(true);
+    auto_optimize_cv_.notify_all();
+  }
+  if (auto_optimize_thread_.joinable()) {
+    auto_optimize_thread_.join();
+  }
+}
+
+void CollectionImpl::auto_optimize_loop() {
+  using Clock = std::chrono::steady_clock;
+  // Start with a last_run far enough in the past that the first check
+  // isn't blocked by cooldown. Using time_point::min() would overflow
+  // the arithmetic in the cooldown subtraction.
+  auto last_run =
+      Clock::now() -
+      std::chrono::seconds(options_.auto_optimize_cooldown_seconds_ + 1);
+
+  while (true) {
+    {
+      std::unique_lock<std::mutex> lk(auto_optimize_mtx_);
+      auto_optimize_cv_.wait_for(
+          lk,
+          std::chrono::seconds(options_.auto_optimize_interval_seconds_),
+          [this] { return auto_optimize_stop_.load(); });
+    }
+    if (auto_optimize_stop_.load()) break;
+
+    // Cooldown: skip if we ran recently.
+    auto now = Clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_run)
+            .count() <
+        static_cast<int64_t>(options_.auto_optimize_cooldown_seconds_)) {
+      continue;
+    }
+
+    // Check trigger: persisted segment count exceeds threshold.
+    {
+      std::shared_lock<std::shared_mutex> schema_lock(schema_handle_mtx_);
+      if (destroyed_) break;
+      auto segments = get_all_persist_segments();
+      LOG_INFO("AutoOptimize check: persisted_segments=%zu, threshold=%u",
+               segments.size(),
+               options_.auto_optimize_max_segments_);
+      if (segments.size() <=
+          static_cast<size_t>(options_.auto_optimize_max_segments_)) {
+        continue;
+      }
+    }
+
+    // Trigger optimize. Optimize() acquires its own locks internally.
+    OptimizeOptions opts;
+    auto s = Optimize(opts);
+    if (s.ok()) {
+      last_run = Clock::now();
+      LOG_INFO("AutoOptimize completed successfully");
+    } else {
+      LOG_WARN("AutoOptimize failed: %s", s.message().c_str());
+    }
+  }
 }
 
 }  // namespace zvec
