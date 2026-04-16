@@ -1007,19 +1007,31 @@ Examples:
       .def(py::init([](bool read_only, bool enable_mmap,
                        uint32_t max_buffer_size,
                        WalDurability wal_durability,
-                       uint32_t write_shards) {
+                       uint32_t write_shards,
+                       bool auto_optimize_enabled,
+                       uint32_t auto_optimize_interval_seconds,
+                       uint32_t auto_optimize_max_segments,
+                       uint32_t auto_optimize_cooldown_seconds) {
              CollectionOptions o;
              o.read_only_ = read_only;
              o.enable_mmap_ = enable_mmap;
              o.max_buffer_size_ = max_buffer_size;
              o.wal_durability_ = wal_durability;
              o.write_shards_ = write_shards;
+             o.auto_optimize_enabled_ = auto_optimize_enabled;
+             o.auto_optimize_interval_seconds_ = auto_optimize_interval_seconds;
+             o.auto_optimize_max_segments_ = auto_optimize_max_segments;
+             o.auto_optimize_cooldown_seconds_ = auto_optimize_cooldown_seconds;
              return o;
            }),
            py::arg("read_only") = false, py::arg("enable_mmap") = true,
            py::arg("max_buffer_size") = DEFAULT_MAX_BUFFER_SIZE,
            py::arg("wal_durability") = WalDurability::PER_BATCH,
            py::arg("write_shards") = 1u,
+           py::arg("auto_optimize_enabled") = false,
+           py::arg("auto_optimize_interval_seconds") = 60u,
+           py::arg("auto_optimize_max_segments") = 10u,
+           py::arg("auto_optimize_cooldown_seconds") = 300u,
            R"pbdoc(
 Constructs a CollectionOption instance.
 
@@ -1034,6 +1046,14 @@ Args:
         Defaults to PER_BATCH.
     write_shards (int, optional): Number of write shards at create.
         Defaults to 1.
+    auto_optimize_enabled (bool, optional): Enable background
+        auto-optimize thread. Defaults to False.
+    auto_optimize_interval_seconds (int, optional): Check interval
+        for auto-optimize. Defaults to 60.
+    auto_optimize_max_segments (int, optional): Trigger threshold on
+        persisted segment count. Defaults to 10.
+    auto_optimize_cooldown_seconds (int, optional): Minimum time
+        between auto-optimize runs. Defaults to 300.
 )pbdoc")
       .def_property_readonly(
           "enable_mmap",
@@ -1050,6 +1070,26 @@ Args:
       .def_property_readonly(
           "write_shards",
           [](const CollectionOptions &self) { return self.write_shards_; })
+      .def_property_readonly(
+          "auto_optimize_enabled",
+          [](const CollectionOptions &self) {
+            return self.auto_optimize_enabled_;
+          })
+      .def_property_readonly(
+          "auto_optimize_interval_seconds",
+          [](const CollectionOptions &self) {
+            return self.auto_optimize_interval_seconds_;
+          })
+      .def_property_readonly(
+          "auto_optimize_max_segments",
+          [](const CollectionOptions &self) {
+            return self.auto_optimize_max_segments_;
+          })
+      .def_property_readonly(
+          "auto_optimize_cooldown_seconds",
+          [](const CollectionOptions &self) {
+            return self.auto_optimize_cooldown_seconds_;
+          })
       .def("__repr__",
            [](const CollectionOptions &self) -> std::string {
              return "{"
@@ -1061,38 +1101,41 @@ Args:
                     ", \"wal_durability\":" +
                     std::to_string(static_cast<int>(self.wal_durability_)) +
                     ", \"write_shards\":" +
-                    std::to_string(self.write_shards_) + "}";
+                    std::to_string(self.write_shards_) +
+                    ", \"auto_optimize_enabled\":" +
+                    std::to_string(self.auto_optimize_enabled_) + "}";
            })
       .def(py::pickle(
           [](const CollectionOptions &self) {
-            return py::make_tuple(self.read_only_, self.enable_mmap_,
-                                  self.max_buffer_size_,
-                                  static_cast<uint8_t>(self.wal_durability_),
-                                  self.write_shards_);
+            return py::make_tuple(
+                self.read_only_, self.enable_mmap_, self.max_buffer_size_,
+                static_cast<uint8_t>(self.wal_durability_),
+                self.write_shards_, self.auto_optimize_enabled_,
+                self.auto_optimize_interval_seconds_,
+                self.auto_optimize_max_segments_,
+                self.auto_optimize_cooldown_seconds_);
           },
           [](py::tuple t) {
-            // Accept the pre-Phase-2 3-tuple, the Phase-2 4-tuple, and
-            // the new Phase-5 5-tuple so older pickled options continue
-            // to load.
             CollectionOptions obj{};
-            if (t.size() == 3) {
+            if (t.size() >= 3) {
               obj.read_only_ = t[0].cast<bool>();
               obj.enable_mmap_ = t[1].cast<bool>();
               obj.max_buffer_size_ = t[2].cast<uint32_t>();
-            } else if (t.size() == 4) {
-              obj.read_only_ = t[0].cast<bool>();
-              obj.enable_mmap_ = t[1].cast<bool>();
-              obj.max_buffer_size_ = t[2].cast<uint32_t>();
+            }
+            if (t.size() >= 4) {
               obj.wal_durability_ =
                   static_cast<WalDurability>(t[3].cast<uint8_t>());
-            } else if (t.size() == 5) {
-              obj.read_only_ = t[0].cast<bool>();
-              obj.enable_mmap_ = t[1].cast<bool>();
-              obj.max_buffer_size_ = t[2].cast<uint32_t>();
-              obj.wal_durability_ =
-                  static_cast<WalDurability>(t[3].cast<uint8_t>());
+            }
+            if (t.size() >= 5) {
               obj.write_shards_ = t[4].cast<uint32_t>();
-            } else {
+            }
+            if (t.size() >= 9) {
+              obj.auto_optimize_enabled_ = t[5].cast<bool>();
+              obj.auto_optimize_interval_seconds_ = t[6].cast<uint32_t>();
+              obj.auto_optimize_max_segments_ = t[7].cast<uint32_t>();
+              obj.auto_optimize_cooldown_seconds_ = t[8].cast<uint32_t>();
+            }
+            if (t.size() < 3) {
               throw std::runtime_error(
                   "Invalid pickle data for CollectionOptions");
             }

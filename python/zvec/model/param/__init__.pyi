@@ -150,6 +150,10 @@ class CollectionOption:
         max_buffer_size: typing.SupportsInt = 64 * 1024 * 1024,
         wal_durability: WalDurability = ...,
         write_shards: typing.SupportsInt = 1,
+        auto_optimize_enabled: bool = False,
+        auto_optimize_interval_seconds: typing.SupportsInt = 60,
+        auto_optimize_max_segments: typing.SupportsInt = 10,
+        auto_optimize_cooldown_seconds: typing.SupportsInt = 300,
     ) -> None:
         """Constructs a CollectionOption instance."""
 
@@ -165,6 +169,14 @@ class CollectionOption:
     def wal_durability(self) -> WalDurability: ...
     @property
     def write_shards(self) -> int: ...
+    @property
+    def auto_optimize_enabled(self) -> bool: ...
+    @property
+    def auto_optimize_interval_seconds(self) -> int: ...
+    @property
+    def auto_optimize_max_segments(self) -> int: ...
+    @property
+    def auto_optimize_cooldown_seconds(self) -> int: ...
 
 class FlatIndexParam(VectorIndexParam):
     """
