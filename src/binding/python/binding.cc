@@ -18,6 +18,8 @@
 #include "python_param.h"
 #include "python_schema.h"
 #include "python_type.h"
+#include <zvec/ailego/buffer/buffer_manager.h>
+#include "db/common/global_resource.h"
 
 namespace zvec {
 PYBIND11_MODULE(_zvec, m) {
@@ -29,5 +31,19 @@ PYBIND11_MODULE(_zvec, m) {
   ZVecPyConfig::Initialize(m);
   ZVecPyDoc::Initialize(m);
   ZVecPyCollection::Initialize(m);
+
+  // Expose a shutdown helper that Python's atexit can call. C++ static
+  // singletons (GlobalResource, BufferManager) must be torn down while
+  // the OS threading infrastructure is still alive. Registering via
+  // Python's atexit (rather than a pybind11 cpp_function) ensures the
+  // handler survives module cleanup.
+  m.def("_shutdown", []() {
+    try {
+      GlobalResource::Instance().shutdown();
+    } catch (...) {}
+    try {
+      ailego::BufferManager::Instance().cleanup();
+    } catch (...) {}
+  });
 }
 }  // namespace zvec

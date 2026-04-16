@@ -21,6 +21,15 @@ namespace zvec {
 
 class GlobalResource : public ailego::Singleton<GlobalResource> {
  public:
+  // Fully stop and destroy all thread pools. Safe to call multiple
+  // times. Called from the Python/Node.js atexit handler to release
+  // worker threads promptly rather than waiting for process exit.
+  void shutdown() {
+    compact_dispatch_pool_.reset();
+    optimize_thread_pool_.reset();
+    query_thread_pool_.reset();
+  }
+
   void initialize();
 
   ailego::ThreadPool *query_thread_pool() {

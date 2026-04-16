@@ -397,7 +397,18 @@ CollectionImpl::CollectionImpl(const std::string &path) : path_(path) {}
 
 CollectionImpl::~CollectionImpl() {
   if (!destroyed_) {
-    Close();
+    // During destruction the shared_ptr refcount is zero — no external
+    // thread can call methods on this object, so mutual exclusion via
+    // schema_handle_mtx_ is unnecessary. Bypass Close() (which locks
+    // the mutex) and call the internal helpers directly. This avoids a
+    // crash during Python interpreter shutdown where the mutex may be
+    // in an invalid state ("mutex lock failed: Invalid argument").
+    stop_auto_optimize();
+    try {
+      close_unsafe();
+    } catch (...) {
+      // Swallow exceptions during teardown to prevent std::terminate.
+    }
   }
 }
 
@@ -479,6 +490,11 @@ Status CollectionImpl::close_unsafe() {
 
 Status CollectionImpl::Destroy() {
   CHECK_COLLECTION_READONLY_RETURN_STATUS;
+
+  // Stop the auto-optimize thread BEFORE acquiring schema_handle_mtx_.
+  // Omitting this left the thread running — when ~auto_optimize_thread_
+  // later found a joinable thread, it called std::terminate().
+  stop_auto_optimize();
 
   std::lock_guard lock(schema_handle_mtx_);
 
@@ -2575,13 +2591,34 @@ void CollectionImpl::start_auto_optimize() {
 }
 
 void CollectionImpl::stop_auto_optimize() {
-  {
-    std::lock_guard<std::mutex> lk(auto_optimize_mtx_);
+  // Signal the background thread to stop. During Python interpreter
+  // shutdown, mutexes or CVs may be in an invalid state (the C runtime
+  // can tear down threading infrastructure before our destructor runs).
+  // We wrap everything in try/catch so that a "mutex lock failed" from
+  // a corrupted mutex does not call std::terminate.
+  try {
+    {
+      std::lock_guard<std::mutex> lk(auto_optimize_mtx_);
+      auto_optimize_stop_.store(true);
+      auto_optimize_cv_.notify_all();
+    }
+  } catch (...) {
+    // Force the flag even if the lock failed — the thread will see it
+    // on its next atomic load and exit.
     auto_optimize_stop_.store(true);
-    auto_optimize_cv_.notify_all();
   }
-  if (auto_optimize_thread_.joinable()) {
-    auto_optimize_thread_.join();
+  try {
+    if (auto_optimize_thread_.joinable()) {
+      auto_optimize_thread_.join();
+    }
+  } catch (...) {
+    // If join fails (thread already detached or OS state is corrupt),
+    // detach to prevent ~thread from calling std::terminate.
+    try {
+      if (auto_optimize_thread_.joinable()) {
+        auto_optimize_thread_.detach();
+      }
+    } catch (...) {}
   }
 }
 

@@ -26,13 +26,16 @@ class Singleton {
  public:
   using ObjectType = typename std::remove_reference<T>::type;
 
-  //! Retrieve instance of object
+  //! Retrieve instance of object.
+  //! The instance is heap-allocated and intentionally never destroyed.
+  //! This prevents "mutex lock failed: Invalid argument" crashes during
+  //! process shutdown when embedding libraries (Python, Node.js) tear
+  //! down their runtimes before C++ static destructors run.  The OS
+  //! reclaims all process memory at exit regardless.
   static ObjectType &Instance(void) noexcept(
       std::is_nothrow_constructible<ObjectType>::value) {
-    // Since it's a static variable, if the class has already been created,
-    // it won't be created again. And it is thread-safe in C++11.
-    static ObjectType obj;
-    return obj;
+    static ObjectType *obj = new ObjectType;
+    return *obj;
   }
 
  protected:

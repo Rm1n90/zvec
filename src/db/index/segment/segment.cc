@@ -2001,7 +2001,10 @@ Result<VectorColumnIndexer::Ptr> SegmentImpl::merge_vector_indexer(
   VectorColumnIndexer::Ptr vector_indexer =
       std::make_shared<VectorColumnIndexer>(index_file_path, field);
 
-  vector_column_params::ReadOptions options{options_.enable_mmap_, true};
+  // Always use MMAP for creating new index files. BufferStorage ignores
+  // the create_if_missing flag and fails to open non-existent files.
+  vector_column_params::ReadOptions options{/*use_mmap=*/true,
+                                            /*create_new=*/true};
 
   auto s = vector_indexer->Open(options);
   CHECK_RETURN_STATUS_EXPECTED(s);
@@ -2279,7 +2282,10 @@ Status SegmentImpl::drop_vector_index(
 
   auto new_vector_indexer = std::make_shared<VectorColumnIndexer>(
       index_file_path, *field_with_default_index);
-  vector_column_params::ReadOptions options{options_.enable_mmap_, true};
+  // Always use MMAP for creating new index files (BufferStorage ignores
+  // create_if_missing and fails on non-existent files).
+  vector_column_params::ReadOptions options{/*use_mmap=*/true,
+                                            /*create_new=*/true};
 
   auto s = new_vector_indexer->Open(options);
   CHECK_RETURN_STATUS(s);

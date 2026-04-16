@@ -163,6 +163,18 @@ __all__ = [
 ]
 
 # ==============================
+# Shutdown — clean up C++ singletons before interpreter finalization.
+# C++ static singletons (thread pools, buffer manager) use mutexes
+# that become invalid during Python module unloading.  We shut them
+# down from an atexit handler while they are still valid.
+# ==============================
+import atexit as _atexit
+
+from _zvec import _shutdown as _native_shutdown
+
+_atexit.register(_native_shutdown)
+
+# ==============================
 # Version handling
 # ==============================
 __version__: str

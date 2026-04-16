@@ -48,7 +48,9 @@
 - **极致性能**：毫秒级响应，轻松检索数十亿级向量。
 - **开箱即用**：[安装](#-安装)后即刻开始搜索，无需服务器、无需配置、零门槛。
 - **稠密 + 稀疏向量**：支持稠密向量和稀疏向量，提供多向量联合查询的原生支持。
-- **混合检索**：向量语义搜索 + 标量条件过滤，获得精确结果。
+- **混合检索**：向量语义搜索 + [全文搜索 (BM25)](#-全文搜索-bm25) + 标量条件过滤，获得精确结果。
+- **写入分片**：[多分片并行写入](#-写入分片与并发)，每个分片独立加锁，实现高吞吐量数据写入。
+- **后台优化**：[AutoOptimizer](#自动优化) 自动合并段；[OptimizeOption](#手动优化) 提供并行度、内存预算和取消控制。
 - **进程内运行**：无需单独部署服务，纯进程内运行。Notebook、高性能服务器、CLI 工具、边缘设备 — 随处可用。
 
 ## 📦 安装
@@ -105,6 +107,155 @@ results = collection.query(
 
 # 查询结果：按相关性排序的 {'id': str, 'score': float, ...} 列表
 print(results)
+```
+
+## 🔧 配置
+
+在执行任何操作之前调用一次 `zvec.init()`。所有参数均为可选 — 省略时 Zvec 会从运行环境自动检测（支持 cgroup 容器感知）。
+
+```python
+import zvec
+from zvec import LogLevel, LogType
+
+zvec.init(
+    log_type=LogType.CONSOLE,              # CONSOLE 或 FILE
+    log_level=LogLevel.WARN,               # DEBUG, INFO, WARN, ERROR, FATAL
+    query_threads=None,                    # None = 从 CPU/cgroup 自动检测
+    optimize_threads=None,                 # 后台优化线程数
+    max_query_topk=1024,                   # 每次查询允许的最大 topk（默认 1024）
+    memory_limit_mb=None,                  # 软内存上限（None = cgroup * 0.8）
+    invert_to_forward_scan_ratio=0.9,      # 基于代价的优化器阈值 [0, 1]
+    brute_force_by_keys_ratio=0.1,         # 暴力搜索 vs 索引阈值 [0, 1]
+)
+```
+
+## 🔍 全文搜索 (BM25)
+
+通过内置 BM25 索引在向量相似度检索的基础上增加关键词搜索：
+
+```python
+import zvec
+
+schema = zvec.CollectionSchema(
+    name="articles",
+    fields=[
+        zvec.FieldSchema("title", zvec.DataType.STRING),
+        zvec.FieldSchema(
+            "body", zvec.DataType.STRING,
+            index_param=zvec.FtsIndexParam(tokenizer="default", k1=1.2, b=0.75),
+        ),
+    ],
+    vectors=[zvec.VectorSchema("embedding", zvec.DataType.VECTOR_FP32, 128)],
+)
+collection = zvec.create_and_open("./articles_db", schema)
+
+# 插入文档
+collection.insert([
+    zvec.Doc(id="1", fields={"title": "简介", "body": "the quick brown fox"},
+             vectors={"embedding": [0.1] * 128}),
+    zvec.Doc(id="2", fields={"title": "其他", "body": "a lazy dog sleeps"},
+             vectors={"embedding": [0.2] * 128}),
+])
+
+# 纯文本搜索
+results = collection.query_text(
+    zvec.TextQuery(field_name="body", text="quick fox", topk=10, op=zvec.MatchOp.OR)
+)
+
+# 混合搜索（向量 + BM25，通过 RRF 融合）
+results = collection.query(
+    vectors=zvec.VectorQuery("embedding", vector=[0.1] * 128),
+    text=zvec.TextQuery(field_name="body", text="quick fox", topk=10),
+    topk=10,
+    reranker=zvec.RrfReRanker(topn=10),
+)
+```
+
+`MatchOp.OR` 匹配包含**任意**查询词的文档；`MatchOp.AND` 要求**所有**查询词都必须出现。
+
+## ⚡ 写入分片与并发
+
+启用写入侧分片以支持多线程并行写入：
+
+```python
+option = zvec.CollectionOption(
+    write_shards=4,                          # 4 个独立写入段
+    wal_durability=zvec.WalDurability.PER_BATCH,  # 每批次一次 fsync（默认）
+)
+collection = zvec.create_and_open("./sharded_db", schema, option=option)
+```
+
+每个分片有独立的互斥锁 — 写入不同分片的线程可以并发执行。文档通过主键的 CRC32C 哈希确定性路由到对应分片。
+
+**WAL 持久性模式：**
+
+| 模式 | 行为 | 适用场景 |
+|------|------|----------|
+| `WalDurability.NONE` | 不主动 fsync；由操作系统决定何时刷盘 | 最大吞吐量，崩溃不安全 |
+| `WalDurability.PER_BATCH` | 每个写入批次一次 fsync（默认） | 平衡持久性与速度 |
+| `WalDurability.PER_DOC` | 每条记录后立即 fsync | 最强持久性保证 |
+
+## 🔄 优化
+
+### 手动优化
+
+合并段并重建索引，支持完整的并行度控制：
+
+```python
+# 基础优化
+collection.optimize()
+
+# 高级：并行分发 + 内存预算 + 取消支持
+token = zvec.CancelToken()
+collection.optimize(zvec.OptimizeOption(
+    concurrency=4,                     # 每个压缩/索引任务的线程数（0 = 自动）
+    parallel_tasks=2,                  # 最大并发任务数（0 = 自动）
+    memory_budget_bytes=4 * 1024**3,   # 4 GB 软限制
+    cancel_token=token,                # 协作式取消
+))
+
+# 可从其他线程取消
+token.cancel()
+```
+
+### 自动优化
+
+启用后台自动优化，当段数量积累时自动触发：
+
+```python
+option = zvec.CollectionOption(
+    auto_optimize_enabled=True,
+    auto_optimize_interval_seconds=60,     # 每 60 秒检查一次（默认）
+    auto_optimize_max_segments=10,         # 超过 10 个段时触发（默认）
+    auto_optimize_cooldown_seconds=300,    # 两次运行间至少 5 分钟（默认）
+)
+collection = zvec.create_and_open("./auto_opt_db", schema, option=option)
+# 后台线程自动监控段数量并执行优化。
+```
+
+## 📋 索引类型
+
+| 索引 | 类 | 适用场景 |
+|------|---|----------|
+| **HNSW** | `HnswIndexParam(m=50, ef_construction=500)` | 通用近似最近邻搜索 |
+| **HNSW-RabitQ** | `HnswRabitqIndexParam(total_bits=7, num_clusters=16)` | 内存高效的量化 ANN |
+| **IVF** | `IVFIndexParam(n_list=0, n_iters=10)` | 基于聚类剪枝的大规模检索 |
+| **Flat** | `FlatIndexParam()` | 精确搜索（暴力扫描） |
+| **Inverted** | `InvertIndexParam(enable_range_optimization=True)` | 标量字段过滤 |
+| **FTS** | `FtsIndexParam(tokenizer="default", k1=1.2, b=0.75)` | 全文关键词搜索 (BM25) |
+
+**查询时参数：**
+
+```python
+# HNSW：控制精度与速度的权衡
+param = zvec.HnswQueryParam(ef=300, is_using_refiner=False)
+results = collection.query(
+    zvec.VectorQuery("embedding", vector=[...], param=param),
+    topk=10,
+)
+
+# IVF：控制聚类探测深度
+param = zvec.IVFQueryParam(nprobe=20)
 ```
 
 ## 📈 极致性能
