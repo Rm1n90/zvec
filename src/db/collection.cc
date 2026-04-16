@@ -322,6 +322,11 @@ class CollectionImpl : public Collection {
   // rotated, the old one is handed off to segment_manager_ and a fresh
   // one is placed at the same index with its own reserved doc-id range.
   std::vector<Segment::Ptr> writing_segments_;
+  // Phase 5.5: per-shard write mutexes. A writer to shard S takes
+  // `shard_write_mtx_[S]` exclusively + `write_mtx_` shared. This lets
+  // writers to different shards run concurrently while DDL / Optimize /
+  // rotation still take `write_mtx_` exclusively to quiesce everything.
+  std::vector<std::unique_ptr<std::mutex>> shard_write_mtx_;
   // non-writing segments, sort by doc_id range
   SegmentManager::Ptr segment_manager_;
 
@@ -1790,8 +1795,11 @@ Result<WriteResults> CollectionImpl::write_impl(std::vector<Doc> &docs,
     CHECK_RETURN_STATUS_EXPECTED(validate);
   }
 
-  // TODO: The granularity of the write_lock is too coarse.
-  std::lock_guard write_lock(write_mtx_);
+  // Phase 5.5: take write_mtx_ SHARED so multiple writer threads can
+  // insert concurrently. DDL / Optimize / close take it exclusively,
+  // blocking all writers for their duration. Per-shard locks below
+  // serialize writers that happen to target the same shard.
+  std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
 
   if (docs.size() > kMaxWriteBatchSize) {
     return tl::make_unexpected(Status::InvalidArgument(
@@ -1853,6 +1861,11 @@ Result<WriteResults> CollectionImpl::write_impl(std::vector<Doc> &docs,
 
   for (size_t shard = 0; shard < n; ++shard) {
     if (per_shard_docs[shard].empty()) continue;
+
+    // Phase 5.5: per-shard exclusive lock. Multiple writer threads
+    // targeting different shards can run concurrently; only writers
+    // to the SAME shard serialize here.
+    std::lock_guard<std::mutex> shard_lock(*shard_write_mtx_[shard]);
 
     // Rotate this shard's writing segment if it's already at capacity.
     // We don't chunk mid-batch — the segment may temporarily exceed
@@ -1944,22 +1957,21 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
     return new_segment.error();
   }
 
-  Version version = version_manager_->get_current_version();
-  auto writing_segment_meta = ws->meta();
-  writing_segment_meta->remove_writing_forward_block();
-  s = version.add_persisted_segment_meta(writing_segment_meta);
-  CHECK_RETURN_STATUS(s);
+  // Phase 5.5: `modify_and_apply` holds VersionManager's internal
+  // mutex across the read-modify cycle, preventing the race that occurs
+  // when two shards rotate concurrently under per-shard locks.
+  auto old_meta = ws->meta();
+  old_meta->remove_writing_forward_block();
 
   ws = new_segment.value();
-  // Phase 5 note: the manifest still persists a singular
-  // writing_segment_meta at this step; the per-shard metas are written
-  // in Step 5. For N=1 (current default) shard 0's meta IS the
-  // authoritative writing_segment_meta, matching the pre-Phase-5
-  // manifest format.
-  sync_writing_state_to_version(version);
-  version.set_next_segment_id(segment_id_allocator_.load());
 
-  s = version_manager_->apply(version);
+  s = version_manager_->modify_and_apply([&](Version &version) -> Status {
+    auto vs = version.add_persisted_segment_meta(old_meta);
+    CHECK_RETURN_STATUS(vs);
+    sync_writing_state_to_version(version);
+    version.set_next_segment_id(segment_id_allocator_.load());
+    return Status::OK();
+  });
   CHECK_RETURN_STATUS(s);
   s = version_manager_->flush();
   CHECK_RETURN_STATUS(s);
@@ -1975,8 +1987,8 @@ Result<WriteResults> CollectionImpl::Delete(
 
   CHECK_DESTROY_RETURN_STATUS_EXPECTED(destroyed_, false);
 
-  // TODO: The granularity of the write_lock is too coarse.
-  std::lock_guard write_lock(write_mtx_);
+  // Phase 5.5: shared write_mtx_ for concurrent deletes.
+  std::shared_lock<std::shared_mutex> write_lock(write_mtx_);
 
   // Phase 5: partition pks by shard and dispatch one DeleteBatch per
   // shard. For N=1 this is a single call, matching the Phase 2/3
@@ -1993,6 +2005,7 @@ Result<WriteResults> CollectionImpl::Delete(
 
   for (size_t shard = 0; shard < n; ++shard) {
     if (per_shard_pks[shard].empty()) continue;
+    std::lock_guard<std::mutex> shard_lock(*shard_write_mtx_[shard]);
     auto seg = writing_segment_of_shard(shard);
     auto shard_results = seg->DeleteBatch(per_shard_pks[shard]);
     if (!shard_results.has_value()) {
@@ -2258,6 +2271,12 @@ Status CollectionImpl::recovery() {
   }
   writing_segments_.clear();
   writing_segments_.resize(writing_metas.size());
+  // Phase 5.5: init per-shard write mutexes.
+  shard_write_mtx_.clear();
+  shard_write_mtx_.resize(writing_metas.size());
+  for (size_t i = 0; i < writing_metas.size(); ++i) {
+    shard_write_mtx_[i] = std::make_unique<std::mutex>();
+  }
   for (size_t shard = 0; shard < writing_metas.size(); ++shard) {
     if (!writing_metas[shard]) {
       return Status::InternalError(
@@ -2425,6 +2444,12 @@ Status CollectionImpl::init_writing_segment() {
       std::max<uint32_t>(options_.write_shards_, 1u);
   writing_segments_.clear();
   writing_segments_.resize(n);
+  // Phase 5.5: one per-shard write mutex per shard.
+  shard_write_mtx_.clear();
+  shard_write_mtx_.resize(n);
+  for (size_t i = 0; i < n; ++i) {
+    shard_write_mtx_[i] = std::make_unique<std::mutex>();
+  }
 
   for (size_t shard = 0; shard < n; ++shard) {
     const auto min_doc_id = reserve_doc_id_range_for_new_segment();

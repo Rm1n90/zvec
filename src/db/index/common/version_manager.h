@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -250,6 +251,14 @@ class VersionManager {
 
   // overwrite the current version
   Status apply(const Version &version);
+
+  // Atomic read-modify-write: holds the internal mutex across get +
+  // modifier call + apply. Prevents the race that occurs when two
+  // callers each do get_current_version() → modify → apply()
+  // concurrently, where the second apply would overwrite the first's
+  // changes without seeing them. The modifier receives a mutable
+  // reference to the live Version and may mutate it freely.
+  Status modify_and_apply(const std::function<Status(Version &)> &modifier);
 
   Status reset_writing_segment_meta(SegmentMeta::Ptr meta);
 

@@ -305,6 +305,12 @@ Status VersionManager::apply(const Version &version) {
   return Status::OK();
 }
 
+Status VersionManager::modify_and_apply(
+    const std::function<Status(Version &)> &modifier) {
+  std::lock_guard lock(mtx_);
+  return modifier(current_version_);
+}
+
 Status VersionManager::reset_writing_segment_meta(SegmentMeta::Ptr meta) {
   std::lock_guard lock(mtx_);
   current_version_.reset_writing_segment_meta(meta);
