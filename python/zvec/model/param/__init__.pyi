@@ -130,12 +130,16 @@ class CollectionOption:
             Default 64 MiB. Ignored when read_only=True.
         wal_durability (WalDurability): WAL fsync policy. Default
             PER_BATCH (one fsync per write call).
+        write_shards (int): Number of write shards. Only honored at
+            create time; persisted in the manifest and immutable
+            afterwards. Default 1 (unsharded).
 
     Examples:
         >>> opt = CollectionOption(read_only=True, enable_mmap=False)
         >>> print(opt.read_only)
         True
         >>> opt2 = CollectionOption(wal_durability=WalDurability.PER_DOC)
+        >>> opt3 = CollectionOption(write_shards=4)
     """
 
     def __getstate__(self) -> tuple: ...
@@ -145,6 +149,7 @@ class CollectionOption:
         enable_mmap: bool = True,
         max_buffer_size: typing.SupportsInt = 64 * 1024 * 1024,
         wal_durability: WalDurability = ...,
+        write_shards: typing.SupportsInt = 1,
     ) -> None:
         """Constructs a CollectionOption instance."""
 
@@ -158,6 +163,8 @@ class CollectionOption:
     def max_buffer_size(self) -> int: ...
     @property
     def wal_durability(self) -> WalDurability: ...
+    @property
+    def write_shards(self) -> int: ...
 
 class FlatIndexParam(VectorIndexParam):
     """

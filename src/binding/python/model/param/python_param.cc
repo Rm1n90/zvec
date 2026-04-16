@@ -992,26 +992,34 @@ Attributes:
         segment, in bytes. Default 64 MiB. Ignored when read_only=True.
     wal_durability (WalDurability): WAL fsync policy. Default
         PER_BATCH (one fsync per write call).
+    write_shards (int): Number of write shards for this collection.
+        Only honored at create time; persisted in the manifest and
+        immutable afterwards. Default 1 (unsharded). Pick a value that
+        matches your expected concurrent writer count.
 
 Examples:
     >>> opt = CollectionOption(read_only=True, enable_mmap=False)
     >>> print(opt.read_only)
     True
     >>> opt2 = CollectionOption(wal_durability=WalDurability.PER_DOC)
+    >>> opt3 = CollectionOption(write_shards=4)
 )pbdoc")
       .def(py::init([](bool read_only, bool enable_mmap,
                        uint32_t max_buffer_size,
-                       WalDurability wal_durability) {
+                       WalDurability wal_durability,
+                       uint32_t write_shards) {
              CollectionOptions o;
              o.read_only_ = read_only;
              o.enable_mmap_ = enable_mmap;
              o.max_buffer_size_ = max_buffer_size;
              o.wal_durability_ = wal_durability;
+             o.write_shards_ = write_shards;
              return o;
            }),
            py::arg("read_only") = false, py::arg("enable_mmap") = true,
            py::arg("max_buffer_size") = DEFAULT_MAX_BUFFER_SIZE,
            py::arg("wal_durability") = WalDurability::PER_BATCH,
+           py::arg("write_shards") = 1u,
            R"pbdoc(
 Constructs a CollectionOption instance.
 
@@ -1024,6 +1032,8 @@ Args:
         bytes. Defaults to 64 MiB.
     wal_durability (WalDurability, optional): WAL fsync policy.
         Defaults to PER_BATCH.
+    write_shards (int, optional): Number of write shards at create.
+        Defaults to 1.
 )pbdoc")
       .def_property_readonly(
           "enable_mmap",
@@ -1037,6 +1047,9 @@ Args:
       .def_property_readonly(
           "wal_durability",
           [](const CollectionOptions &self) { return self.wal_durability_; })
+      .def_property_readonly(
+          "write_shards",
+          [](const CollectionOptions &self) { return self.write_shards_; })
       .def("__repr__",
            [](const CollectionOptions &self) -> std::string {
              return "{"
@@ -1047,17 +1060,20 @@ Args:
                     std::to_string(self.max_buffer_size_) +
                     ", \"wal_durability\":" +
                     std::to_string(static_cast<int>(self.wal_durability_)) +
-                    "}";
+                    ", \"write_shards\":" +
+                    std::to_string(self.write_shards_) + "}";
            })
       .def(py::pickle(
           [](const CollectionOptions &self) {
             return py::make_tuple(self.read_only_, self.enable_mmap_,
                                   self.max_buffer_size_,
-                                  static_cast<uint8_t>(self.wal_durability_));
+                                  static_cast<uint8_t>(self.wal_durability_),
+                                  self.write_shards_);
           },
           [](py::tuple t) {
-            // Accept the pre-Phase-2 3-tuple and the new 4-tuple so
-            // older pickled options continue to load.
+            // Accept the pre-Phase-2 3-tuple, the Phase-2 4-tuple, and
+            // the new Phase-5 5-tuple so older pickled options continue
+            // to load.
             CollectionOptions obj{};
             if (t.size() == 3) {
               obj.read_only_ = t[0].cast<bool>();
@@ -1069,6 +1085,13 @@ Args:
               obj.max_buffer_size_ = t[2].cast<uint32_t>();
               obj.wal_durability_ =
                   static_cast<WalDurability>(t[3].cast<uint8_t>());
+            } else if (t.size() == 5) {
+              obj.read_only_ = t[0].cast<bool>();
+              obj.enable_mmap_ = t[1].cast<bool>();
+              obj.max_buffer_size_ = t[2].cast<uint32_t>();
+              obj.wal_durability_ =
+                  static_cast<WalDurability>(t[3].cast<uint8_t>());
+              obj.write_shards_ = t[4].cast<uint32_t>();
             } else {
               throw std::runtime_error(
                   "Invalid pickle data for CollectionOptions");

@@ -183,10 +183,31 @@ message Manifest {
 
   repeated SegmentMeta persisted_segment_metas = 4;
 
+  // Pre-Phase-5: single writing segment. Retained for back-compat with
+  // manifests written by older code. When `writing_segment_metas` (field
+  // 9) is non-empty, that takes precedence; this field is ignored.
   SegmentMeta writing_segment_meta = 5;
 
   uint32 id_map_path_suffix = 6;
   uint32 delete_snapshot_path_suffix = 7;
 
   uint32 next_segment_id = 8;
+
+  // Phase 5: per-shard writing segments. `writing_segment_metas[i]` owns
+  // shard i. When present this is authoritative; `writing_segment_meta`
+  // (field 5) is ignored on load.
+  repeated SegmentMeta writing_segment_metas = 9;
+
+  // Phase 5: number of write shards. Immutable after collection create.
+  // Missing / 0 means "infer from writing_segment_metas.size() or fall
+  // back to 1" — this covers both new manifests that omit the field on
+  // purpose and old manifests written before Phase 5.
+  uint32 write_shards = 10;
+
+  // Phase 5: next doc_id the collection will hand out to a new writing
+  // segment as its min_doc_id. Used by the global doc-id range
+  // allocator so separate shards' segments get non-overlapping
+  // contiguous ranges. Missing / 0 on old manifests → reconstructed
+  // from max(persisted + writing) doc_id + 1 on open.
+  uint64 next_min_doc_id = 11;
 };

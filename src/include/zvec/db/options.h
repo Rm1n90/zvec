@@ -53,11 +53,19 @@ struct CollectionOptions {
       DEFAULT_MAX_BUFFER_SIZE};  // ignored when read_only=true
   WalDurability wal_durability_{WalDurability::PER_BATCH};
 
+  // Number of write shards for this collection. Only honored at
+  // CreateAndOpen; once the collection exists the value is persisted
+  // in the manifest and Open reads it from there (the options_
+  // field is ignored). Default 1 = unsharded. Valid range is [1, 64];
+  // pick a value that matches your expected concurrent writer count.
+  uint32_t write_shards_{1};
+
   bool operator==(const CollectionOptions &other) const {
     return read_only_ == other.read_only_ &&
            enable_mmap_ == other.enable_mmap_ &&
            max_buffer_size_ == other.max_buffer_size_ &&
-           wal_durability_ == other.wal_durability_;
+           wal_durability_ == other.wal_durability_ &&
+           write_shards_ == other.write_shards_;
   }
 
   bool operator!=(const CollectionOptions &other) const {
@@ -68,11 +76,13 @@ struct CollectionOptions {
 
   CollectionOptions(bool read_only, bool enable_mmap,
                     uint32_t max_buffer_size = DEFAULT_MAX_BUFFER_SIZE,
-                    WalDurability wal_durability = WalDurability::PER_BATCH)
+                    WalDurability wal_durability = WalDurability::PER_BATCH,
+                    uint32_t write_shards = 1)
       : read_only_(read_only),
         enable_mmap_(enable_mmap),
         max_buffer_size_(max_buffer_size),
-        wal_durability_(wal_durability) {}
+        wal_durability_(wal_durability),
+        write_shards_(write_shards) {}
 };
 
 struct SegmentOptions {

@@ -58,11 +58,26 @@ Status Version::Load(const std::string &path, Version *version) {
     version->add_persisted_segment_meta(meta);
   }
 
-  if (manifest.has_writing_segment_meta()) {
+  // Phase 5 load rules:
+  //   * If the plural field is populated, use it verbatim (new format).
+  //   * Else fall back to the singular field (pre-Phase-5 manifest) as
+  //     a one-shard vector.
+  if (manifest.writing_segment_metas_size() > 0) {
+    std::vector<SegmentMeta::Ptr> metas;
+    metas.reserve(manifest.writing_segment_metas_size());
+    for (int i = 0; i < manifest.writing_segment_metas_size(); ++i) {
+      metas.push_back(
+          ProtoConverter::FromPb(manifest.writing_segment_metas(i)));
+    }
+    version->set_writing_segment_metas(metas);
+  } else if (manifest.has_writing_segment_meta()) {
     SegmentMeta::Ptr meta =
         ProtoConverter::FromPb(manifest.writing_segment_meta());
     version->reset_writing_segment_meta(meta);
   }
+
+  version->set_write_shards(manifest.write_shards());
+  version->set_next_min_doc_id(manifest.next_min_doc_id());
 
   version->set_id_map_path_suffix(manifest.id_map_path_suffix());
   version->set_delete_snapshot_path_suffix(
@@ -95,10 +110,29 @@ Status Version::Save(const std::string &path, const Version &version) {
     manifest.add_persisted_segment_metas()->Swap(&meta_pb);
   }
 
-  if (version.writing_segment_meta()) {
-    auto meta_pb = ProtoConverter::ToPb(*version.writing_segment_meta());
+  // Phase 5 save rules:
+  //   * Always populate the plural field from writing_segment_metas().
+  //   * When n_shards == 1, ALSO populate the singular
+  //     writing_segment_meta field so pre-Phase-5 readers still
+  //     recognise the collection.
+  //   * When n_shards > 1 the singular field is intentionally left
+  //     absent — older readers cannot correctly open a sharded
+  //     collection, and leaving the field absent surfaces that
+  //     clearly instead of presenting shard 0 as if it were the
+  //     whole collection.
+  const auto &metas = version.writing_segment_metas();
+  for (const auto &meta : metas) {
+    if (!meta) continue;
+    auto meta_pb = ProtoConverter::ToPb(*meta);
+    manifest.add_writing_segment_metas()->Swap(&meta_pb);
+  }
+  if (metas.size() == 1 && metas.front()) {
+    auto meta_pb = ProtoConverter::ToPb(*metas.front());
     manifest.mutable_writing_segment_meta()->Swap(&meta_pb);
   }
+
+  manifest.set_write_shards(version.write_shards());
+  manifest.set_next_min_doc_id(version.next_min_doc_id());
 
   manifest.set_id_map_path_suffix(version.id_map_path_suffix());
   manifest.set_delete_snapshot_path_suffix(
@@ -125,16 +159,22 @@ std::string Version::to_string() const {
     ++i;
   }
 
-  oss << "],writing_segment_meta:";
-  if (writing_segment_meta_) {
-    oss << writing_segment_meta_->to_string();
-  } else {
-    oss << "null";
+  oss << "],writing_segment_metas:[";
+  for (size_t wi = 0; wi < writing_segment_metas_.size(); ++wi) {
+    if (wi > 0) oss << ",";
+    if (writing_segment_metas_[wi]) {
+      oss << writing_segment_metas_[wi]->to_string();
+    } else {
+      oss << "null";
+    }
   }
+  oss << "]";
 
   oss << ",id_map_path_suffix:" << id_map_path_suffix_
       << ",delete_snapshot_path_suffix:" << delete_snapshot_path_suffix_
       << ",next_segment_id:" << next_segment_id_
+      << ",write_shards:" << write_shards_
+      << ",next_min_doc_id:" << next_min_doc_id_
       << ",enable_mmap:" << enable_mmap_ << "}";
   return oss.str();
 }
@@ -164,14 +204,19 @@ std::string Version::to_string_formatted(int indent_level) const {
 
   oss << "\n"
       << indent(indent_level + 1) << "],\n"
-      << indent(indent_level + 1) << "writing_segment_meta: ";
+      << indent(indent_level + 1) << "writing_segment_metas: [\n";
 
-  if (writing_segment_meta_) {
-    oss << "\n"
-        << writing_segment_meta_->to_string_formatted(indent_level + 2) << "\n";
-  } else {
-    oss << "null\n";
+  for (size_t wi = 0; wi < writing_segment_metas_.size(); ++wi) {
+    if (writing_segment_metas_[wi]) {
+      oss << writing_segment_metas_[wi]->to_string_formatted(indent_level + 2);
+    } else {
+      oss << indent(indent_level + 2) << "null";
+    }
+    if (wi + 1 < writing_segment_metas_.size()) oss << ",";
+    oss << "\n";
   }
+
+  oss << indent(indent_level + 1) << "],\n";
 
   oss << indent(indent_level + 1)
       << "id_map_path_suffix: " << id_map_path_suffix_ << ",\n"

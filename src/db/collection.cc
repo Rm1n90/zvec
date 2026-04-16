@@ -152,9 +152,12 @@ class CollectionImpl : public Collection {
   Status init_writing_segment();
 
   bool need_switch_to_new_segment() const;
+  bool need_switch_to_new_segment(size_t shard) const;
 
   Status switch_to_new_segment_for_writing(
       const CollectionSchema::Ptr &schema = nullptr);
+  Status switch_to_new_segment_for_writing(
+      size_t shard, const CollectionSchema::Ptr &schema = nullptr);
 
   Result<WriteResults> write_impl(std::vector<Doc> &docs, WriteMode mode);
 
@@ -162,39 +165,33 @@ class CollectionImpl : public Collection {
 
   std::vector<Segment::Ptr> get_all_persist_segments() const;
 
-  // === Phase 4 — read-side shard abstraction ==============================
-  // These accessors let query / DDL / iteration sites treat the
-  // writing-segment layer as a logical fan-out over N_shards shards.
-  // Phase 4 hardcodes N_shards = 1, so they behave as if the collection
-  // has exactly one writing segment — matching the pre-Phase-4
-  // behaviour exactly. Phase 5 will swap the body of these accessors
-  // to a real per-shard writing_segments_ vector without touching any
-  // of the call sites.
-  static constexpr size_t kPhase4ShardCount = 1;
-
-  size_t n_shards() const { return kPhase4ShardCount; }
+  // === Shard routing — introduced in Phase 4, real in Phase 5 ============
+  // The accessors here hide a per-shard writing_segments_ vector from
+  // the callers. They're safe to call with any shard in [0, n_shards()).
+  size_t n_shards() const {
+    return writing_segments_.empty() ? 1 : writing_segments_.size();
+  }
 
   size_t shard_of_pk(const std::string &pk) const {
     return PkToShard(pk, n_shards());
   }
 
-  // Returns the writing segment that owns `shard`. Phase 4: only shard
-  // 0 is valid.
+  // Writing segment for a given shard. Callers must hold a lock that
+  // protects writing_segments_[shard] against concurrent rotation
+  // (write_mtx_ / ddl_mtx_). Returns by value (shared_ptr copy) so the
+  // caller holds a strong ref even if a later rotation swaps the slot.
   Segment::Ptr writing_segment_of_shard(size_t shard) const {
-    (void)shard;  // assert once Phase 5 lands; for now shard must be 0
-    return writing_segment_;
+    return writing_segments_[shard];
   }
 
-  // Returns the writing segment a given pk routes to. Phase 5 will make
-  // this non-degenerate.
   Segment::Ptr writing_segment_for_pk(const std::string &pk) const {
     return writing_segment_of_shard(shard_of_pk(pk));
   }
 
-  // Enumerate every writing segment across every shard. Phase 4 always
-  // returns a one-element vector.
+  // Enumerate every shard's writing segment. Used by query, Stats,
+  // DeleteByFilter, GroupByQuery, Fetch.
   std::vector<Segment::Ptr> all_writing_segments() const {
-    return {writing_segment_};
+    return writing_segments_;
   }
 
   Segment::Ptr local_segment_by_doc_id(
@@ -202,6 +199,33 @@ class CollectionImpl : public Collection {
 
   SegmentID allocate_segment_id() {
     return segment_id_allocator_.fetch_add(1);
+  }
+
+  // Reserve a contiguous doc-id range for a new writing segment (on
+  // any shard). The range is sized at `max_doc_count_per_segment +
+  // kMaxWriteBatchSize`; the safety margin absorbs batches that push
+  // the segment past the soft cap before the next rotation kicks in.
+  // Returns the starting doc-id (min_doc_id for the new segment).
+  uint64_t reserve_doc_id_range_for_new_segment() {
+    const uint64_t reserve = schema_->max_doc_count_per_segment() +
+                             static_cast<uint64_t>(kMaxWriteBatchSize);
+    return next_min_doc_id_.fetch_add(reserve);
+  }
+
+  // Phase 5: capture the per-shard writing-segment metas + collection
+  // shard count + doc-id watermark into `version` so on-disk manifest
+  // writes stay in sync with in-memory state. Called from every
+  // rotation + DDL site that previously did
+  //   version.reset_writing_segment_meta(writing_segment_->meta()).
+  void sync_writing_state_to_version(Version &version) const {
+    std::vector<SegmentMeta::Ptr> metas;
+    metas.reserve(writing_segments_.size());
+    for (const auto &ws : writing_segments_) {
+      metas.push_back(ws ? ws->meta() : SegmentMeta::Ptr{});
+    }
+    version.set_writing_segment_metas(metas);
+    version.set_write_shards(static_cast<uint32_t>(writing_segments_.size()));
+    version.set_next_min_doc_id(next_min_doc_id_.load());
   }
 
   SegmentID allocate_segment_id_for_tmp_segment() {
@@ -280,11 +304,24 @@ class CollectionImpl : public Collection {
   mutable std::shared_mutex schema_handle_mtx_;
   mutable std::shared_mutex write_mtx_;
 
-  std::atomic<SegmentID> segment_id_allocator_;
-  std::atomic<SegmentID> tmp_segment_id_allocator_;
+  std::atomic<SegmentID> segment_id_allocator_{0};
+  std::atomic<SegmentID> tmp_segment_id_allocator_{0};
 
-  // writing segment
-  Segment::Ptr writing_segment_;
+  // Phase 5 global doc-id range allocator. Each new writing segment —
+  // on any shard — carves out a contiguous doc-id range by calling
+  // `reserve_doc_id_range_for_new_segment()` which fetch-adds
+  // max_doc_count_per_segment + kMaxWriteBatchSize (the safety margin
+  // absorbs batches that overflow the soft cap before rotation).
+  // Between shards the reserved ranges are disjoint, preserving the
+  // binary-search invariant in `local_segment_by_doc_id`.
+  std::atomic<uint64_t> next_min_doc_id_{0};
+
+  // Per-shard writing segments. `writing_segments_[i]` is the active
+  // writable segment for shard i. Size is `n_shards()` after
+  // initialisation. All segments are always non-null; when a segment is
+  // rotated, the old one is handed off to segment_manager_ and a fresh
+  // one is placed at the same index with its own reserved doc-id range.
+  std::vector<Segment::Ptr> writing_segments_;
   // non-writing segments, sort by doc_id range
   SegmentManager::Ptr segment_manager_;
 
@@ -381,16 +418,29 @@ Status CollectionImpl::Close() {
 Status CollectionImpl::close_unsafe() {
   Status result = Status::OK();
 
-  // flush
+  // flush writing segments + persist the version manifest so reopen
+  // picks up the latest per-shard writing-segment metas (doc_count,
+  // max_doc_id) without relying on WAL replay for correctness of the
+  // metadata. For N>1 this is essential because each shard's range
+  // evolved since the last explicit version.flush.
   if (!options_.read_only_) {
     auto s = flush_unsafe();
-    if (!s.ok()) {
-      result = s;
+    if (!s.ok()) result = s;
+
+    if (version_manager_) {
+      Version v = version_manager_->get_current_version();
+      sync_writing_state_to_version(v);
+      auto vs = version_manager_->apply(v);
+      if (vs.ok()) {
+        vs = version_manager_->flush();
+      }
+      if (!vs.ok() && result.ok()) result = vs;
     }
   }
 
   // always release resources regardless of flush outcome
-  writing_segment_.reset();
+  for (auto &ws : writing_segments_) ws.reset();
+  writing_segments_.clear();
   segment_manager_.reset();
   version_manager_.reset();
   id_map_.reset();
@@ -428,11 +478,24 @@ Status CollectionImpl::Flush() {
 }
 
 Status CollectionImpl::flush_unsafe() {
-  if (!writing_segment_) {
+  if (writing_segments_.empty()) {
     return Status::InternalError(
-        "flush writing segment failed because writing segment is nullptr");
+        "flush writing segment failed because writing segments are not "
+        "initialised");
   }
-  return writing_segment_->flush();
+  // Flush every shard's writing segment. A partial failure short-circuits
+  // but already-flushed shards stay flushed (their state on disk is a
+  // superset of what callers can observe).
+  for (auto &ws : writing_segments_) {
+    if (!ws) {
+      return Status::InternalError(
+          "flush writing segment failed because a shard has no writing "
+          "segment");
+    }
+    auto s = ws->flush();
+    CHECK_RETURN_STATUS(s);
+  }
+  return Status::OK();
 }
 
 Result<std::string> CollectionImpl::Path() const {
@@ -530,11 +593,11 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
 
   Version new_version = version_manager_->get_current_version();
 
-  if (writing_segment_->doc_count() > 0) {
-    s = writing_segment_->dump();
+  if (writing_segments_[0]->doc_count() > 0) {
+    s = writing_segments_[0]->dump();
     CHECK_RETURN_STATUS(s);
 
-    s = segment_manager_->add_segment(writing_segment_);
+    s = segment_manager_->add_segment(writing_segments_[0]);
     CHECK_RETURN_STATUS(s);
 
     auto seg_options =
@@ -542,26 +605,26 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
                        options_.wal_durability_};
     auto new_segment = Segment::CreateAndOpen(
         path_, *new_schema, allocate_segment_id(),
-        writing_segment_->meta()->max_doc_id() + 1, id_map_, delete_store_,
+        reserve_doc_id_range_for_new_segment(), id_map_, delete_store_,
         version_manager_, seg_options);
     if (!new_segment) {
       return new_segment.error();
     }
 
-    s = new_version.add_persisted_segment_meta(writing_segment_->meta());
+    s = new_version.add_persisted_segment_meta(writing_segments_[0]->meta());
     CHECK_RETURN_STATUS(s);
 
-    writing_segment_ = new_segment.value();
+    writing_segments_[0] = new_segment.value();
     new_version.set_next_segment_id(segment_id_allocator_.load());
 
   } else {
     // TODO: allocate new segment id and clear current writing segment at last
     // recreate writing segment
-    s = writing_segment_->destroy();
+    s = writing_segments_[0]->destroy();
     CHECK_RETURN_STATUS(s);
-    auto id = writing_segment_->id();
-    auto min_doc_id = writing_segment_->meta()->min_doc_id();
-    writing_segment_.reset();
+    auto id = writing_segments_[0]->id();
+    auto min_doc_id = writing_segments_[0]->meta()->min_doc_id();
+    writing_segments_[0].reset();
     SegmentOptions seg_options;
     seg_options.enable_mmap_ = options_.enable_mmap_;
     seg_options.max_buffer_size_ = options_.max_buffer_size_;
@@ -573,9 +636,9 @@ Status CollectionImpl::CreateIndex(const std::string &column_name,
     if (!writing_segment) {
       return writing_segment.error();
     }
-    writing_segment_ = writing_segment.value();
+    writing_segments_[0] = writing_segment.value();
   }
-  new_version.reset_writing_segment_meta(writing_segment_->meta());
+  sync_writing_state_to_version(new_version);
 
   // get_all_segment will return writing segment if it has docs
   auto persist_segments = get_all_persist_segments();
@@ -723,16 +786,16 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
 
   bool is_vector_field = field->is_vector_field();
 
-  if (writing_segment_->doc_count() > 0) {
-    s = writing_segment_->dump();
+  if (writing_segments_[0]->doc_count() > 0) {
+    s = writing_segments_[0]->dump();
     CHECK_RETURN_STATUS(s);
 
-    s = segment_manager_->add_segment(writing_segment_);
+    s = segment_manager_->add_segment(writing_segments_[0]);
     CHECK_RETURN_STATUS(s);
 
     auto new_segment =
         Segment::CreateAndOpen(path_, *new_schema, allocate_segment_id(),
-                               writing_segment_->meta()->max_doc_id() + 1,
+                               reserve_doc_id_range_for_new_segment(),
                                id_map_, delete_store_, version_manager_,
                                SegmentOptions{false, options_.enable_mmap_,
                                               options_.max_buffer_size_,
@@ -741,19 +804,19 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
       return new_segment.error();
     }
 
-    s = new_version.add_persisted_segment_meta(writing_segment_->meta());
+    s = new_version.add_persisted_segment_meta(writing_segments_[0]->meta());
     CHECK_RETURN_STATUS(s);
 
-    writing_segment_ = new_segment.value();
+    writing_segments_[0] = new_segment.value();
     new_version.set_next_segment_id(segment_id_allocator_.load());
 
   } else {
     // recreate writing segment
-    s = writing_segment_->destroy();
+    s = writing_segments_[0]->destroy();
     CHECK_RETURN_STATUS(s);
-    auto id = writing_segment_->id();
-    auto min_doc_id = writing_segment_->meta()->min_doc_id();
-    writing_segment_.reset();
+    auto id = writing_segments_[0]->id();
+    auto min_doc_id = writing_segments_[0]->meta()->min_doc_id();
+    writing_segments_[0].reset();
     SegmentOptions seg_options;
     seg_options.enable_mmap_ = options_.enable_mmap_;
     seg_options.max_buffer_size_ = options_.max_buffer_size_;
@@ -766,9 +829,9 @@ Status CollectionImpl::DropIndex(const std::string &column_name) {
       return writing_segment.error();
     }
 
-    writing_segment_ = writing_segment.value();
+    writing_segments_[0] = writing_segment.value();
   }
-  new_version.reset_writing_segment_meta(writing_segment_->meta());
+  sync_writing_state_to_version(new_version);
 
   auto persist_segments = get_all_persist_segments();
 
@@ -893,7 +956,7 @@ Status CollectionImpl::Optimize(const OptimizeOptions &options) {
     std::shared_lock<std::shared_mutex> schema_lock(schema_handle_mtx_);
     std::lock_guard<std::shared_mutex> write_lock(write_mtx_);
 
-    if (writing_segment_->doc_count() != 0) {
+    if (writing_segments_[0]->doc_count() != 0) {
       auto s = switch_to_new_segment_for_writing();
       if (!s.ok()) return s;
     }
@@ -1443,7 +1506,7 @@ Status CollectionImpl::AddColumn(const FieldSchema::Ptr &column_schema,
   s = new_schema->add_field(column_schema);
   CHECK_RETURN_STATUS(s);
 
-  if (writing_segment_->doc_count() > 0) {
+  if (writing_segments_[0]->doc_count() > 0) {
     s = switch_to_new_segment_for_writing();
     CHECK_RETURN_STATUS(s);
   }
@@ -1456,12 +1519,12 @@ Status CollectionImpl::AddColumn(const FieldSchema::Ptr &column_schema,
   CHECK_RETURN_STATUS(s);
 
   // reset writing segment with new schema
-  auto id = writing_segment_->id();
-  auto min_doc_id = writing_segment_->meta()->min_doc_id();
+  auto id = writing_segments_[0]->id();
+  auto min_doc_id = writing_segments_[0]->meta()->min_doc_id();
 
-  s = writing_segment_->destroy();
+  s = writing_segments_[0]->destroy();
   CHECK_RETURN_STATUS(s);
-  writing_segment_.reset();
+  writing_segments_[0].reset();
 
   SegmentOptions seg_options;
   seg_options.enable_mmap_ = options_.enable_mmap_;
@@ -1474,11 +1537,11 @@ Status CollectionImpl::AddColumn(const FieldSchema::Ptr &column_schema,
   if (!writing_segment) {
     return writing_segment.error();
   }
-  writing_segment_ = writing_segment.value();
+  writing_segments_[0] = writing_segment.value();
 
   // update new version
   new_version.set_schema(*new_schema);
-  new_version.reset_writing_segment_meta(writing_segment_->meta());
+  sync_writing_state_to_version(new_version);
 
   auto new_segment_metas = segment_manager_->get_segments_meta();
   for (auto meta : new_segment_metas) {
@@ -1517,7 +1580,7 @@ Status CollectionImpl::DropColumn(const std::string &column_name) {
   s = new_schema->drop_field(column_name);
   CHECK_RETURN_STATUS(s);
 
-  if (writing_segment_->doc_count() > 0) {
+  if (writing_segments_[0]->doc_count() > 0) {
     s = switch_to_new_segment_for_writing();
     CHECK_RETURN_STATUS(s);
   }
@@ -1529,12 +1592,12 @@ Status CollectionImpl::DropColumn(const std::string &column_name) {
   CHECK_RETURN_STATUS(s);
 
   // reset writing segment with new schema
-  auto id = writing_segment_->id();
-  auto min_doc_id = writing_segment_->meta()->min_doc_id();
+  auto id = writing_segments_[0]->id();
+  auto min_doc_id = writing_segments_[0]->meta()->min_doc_id();
 
-  s = writing_segment_->destroy();
+  s = writing_segments_[0]->destroy();
   CHECK_RETURN_STATUS(s);
-  writing_segment_.reset();
+  writing_segments_[0].reset();
 
   SegmentOptions seg_options;
   seg_options.enable_mmap_ = options_.enable_mmap_;
@@ -1547,11 +1610,11 @@ Status CollectionImpl::DropColumn(const std::string &column_name) {
   if (!writing_segment) {
     return writing_segment.error();
   }
-  writing_segment_ = writing_segment.value();
+  writing_segments_[0] = writing_segment.value();
 
   // update new version
   new_version.set_schema(*new_schema);
-  new_version.reset_writing_segment_meta(writing_segment_->meta());
+  sync_writing_state_to_version(new_version);
 
   auto new_segment_metas = segment_manager_->get_segments_meta();
   for (auto meta : new_segment_metas) {
@@ -1603,7 +1666,7 @@ Status CollectionImpl::AlterColumn(const std::string &column_name,
   s = new_schema->alter_field(column_name, new_field_schema);
   CHECK_RETURN_STATUS(s);
 
-  if (writing_segment_->doc_count() > 0) {
+  if (writing_segments_[0]->doc_count() > 0) {
     s = switch_to_new_segment_for_writing();
     CHECK_RETURN_STATUS(s);
   }
@@ -1616,12 +1679,12 @@ Status CollectionImpl::AlterColumn(const std::string &column_name,
   CHECK_RETURN_STATUS(s);
 
   // reset writing segment with new schema
-  auto id = writing_segment_->id();
-  auto min_doc_id = writing_segment_->meta()->min_doc_id();
+  auto id = writing_segments_[0]->id();
+  auto min_doc_id = writing_segments_[0]->meta()->min_doc_id();
 
-  s = writing_segment_->destroy();
+  s = writing_segments_[0]->destroy();
   CHECK_RETURN_STATUS(s);
-  writing_segment_.reset();
+  writing_segments_[0].reset();
 
   SegmentOptions seg_options;
   seg_options.enable_mmap_ = options_.enable_mmap_;
@@ -1634,11 +1697,11 @@ Status CollectionImpl::AlterColumn(const std::string &column_name,
   if (!writing_segment) {
     return writing_segment.error();
   }
-  writing_segment_ = writing_segment.value();
+  writing_segments_[0] = writing_segment.value();
 
   // update new version
   new_version.set_schema(*new_schema);
-  new_version.reset_writing_segment_meta(writing_segment_->meta());
+  sync_writing_state_to_version(new_version);
 
   auto new_segment_metas = segment_manager_->get_segments_meta();
   for (auto meta : new_segment_metas) {
@@ -1698,7 +1761,7 @@ Status CollectionImpl::internal_fetch_by_doc(const Doc &doc,
 }
 
 Status CollectionImpl::handle_upsert(Doc &doc) {
-  return writing_segment_->Upsert(doc);
+  return writing_segments_[0]->Upsert(doc);
 }
 
 Status CollectionImpl::handle_update(Doc &doc) {
@@ -1707,11 +1770,11 @@ Status CollectionImpl::handle_update(Doc &doc) {
   CHECK_RETURN_STATUS(s);
 
   old_doc->merge(doc);
-  return writing_segment_->Update(*old_doc);
+  return writing_segments_[0]->Update(*old_doc);
 }
 
 Status CollectionImpl::handle_insert(Doc &doc) {
-  return writing_segment_->Insert(doc);
+  return writing_segments_[0]->Insert(doc);
 }
 
 Result<WriteResults> CollectionImpl::write_impl(std::vector<Doc> &docs,
@@ -1774,61 +1837,106 @@ Result<WriteResults> CollectionImpl::write_impl(std::vector<Doc> &docs,
 
   if (working_docs->empty()) return results;
 
-  // Rotate the writing segment if it's already at capacity. We do not
-  // chunk the batch across segments — the segment may temporarily exceed
-  // schema_->max_doc_count_per_segment(); the next write call performs
-  // the rotation. The legacy per-doc loop only rotated *between* docs
-  // for the same reason, so this preserves the existing
-  // grow-then-rotate behaviour for batches that overflow remaining
-  // capacity.
-  if (need_switch_to_new_segment()) {
-    auto s = switch_to_new_segment_for_writing();
-    CHECK_RETURN_STATUS_EXPECTED(s);
+  // Phase 5: partition the working batch by shard. PkToShard deals with
+  // the degenerate N=1 case (always shard 0), so this loop is still
+  // exactly one shard-level dispatch in the common case today. Each
+  // shard's sub-batch rotates independently if its writing segment is
+  // at/over cap, then gets one Insert/Upsert/UpdateBatch call.
+  const size_t n = n_shards();
+  std::vector<std::vector<Doc>> per_shard_docs(n);
+  std::vector<std::vector<size_t>> per_shard_working_idx(n);
+  for (size_t wi = 0; wi < working_docs->size(); ++wi) {
+    const size_t shard = shard_of_pk((*working_docs)[wi].pk());
+    per_shard_docs[shard].push_back((*working_docs)[wi]);
+    per_shard_working_idx[shard].push_back(wi);
   }
 
-  Result<WriteResults> batch_results;
-  switch (mode) {
-    case WriteMode::INSERT:
-      batch_results = writing_segment_->InsertBatch(*working_docs);
-      break;
-    case WriteMode::UPSERT:
-      batch_results = writing_segment_->UpsertBatch(*working_docs);
-      break;
-    case WriteMode::UPDATE:
-      batch_results = writing_segment_->UpdateBatch(*working_docs);
-      break;
-    default:
-      return tl::make_unexpected(
-          Status::InvalidArgument("Invalid write mode"));
-  }
-  if (!batch_results.has_value()) {
-    return batch_results;
-  }
+  for (size_t shard = 0; shard < n; ++shard) {
+    if (per_shard_docs[shard].empty()) continue;
 
-  for (size_t bi = 0; bi < batch_results.value().size(); ++bi) {
-    results[working_to_input_idx[bi]] = std::move(batch_results.value()[bi]);
+    // Rotate this shard's writing segment if it's already at capacity.
+    // We don't chunk mid-batch — the segment may temporarily exceed
+    // max_doc_count_per_segment; the reserved doc-id range carries a
+    // kMaxWriteBatchSize safety margin to absorb that overshoot.
+    if (need_switch_to_new_segment(shard)) {
+      auto s = switch_to_new_segment_for_writing(shard);
+      CHECK_RETURN_STATUS_EXPECTED(s);
+    }
+
+    Result<WriteResults> shard_results;
+    auto seg = writing_segment_of_shard(shard);
+    switch (mode) {
+      case WriteMode::INSERT:
+        shard_results = seg->InsertBatch(per_shard_docs[shard]);
+        break;
+      case WriteMode::UPSERT:
+        shard_results = seg->UpsertBatch(per_shard_docs[shard]);
+        break;
+      case WriteMode::UPDATE:
+        shard_results = seg->UpdateBatch(per_shard_docs[shard]);
+        break;
+      default:
+        return tl::make_unexpected(
+            Status::InvalidArgument("Invalid write mode"));
+    }
+    if (!shard_results.has_value()) {
+      return shard_results;
+    }
+
+    // Splice this shard's per-doc results back into the input-aligned
+    // output vector via the working-idx → input-idx indirection.
+    for (size_t si = 0; si < shard_results.value().size(); ++si) {
+      const size_t wi = per_shard_working_idx[shard][si];
+      results[working_to_input_idx[wi]] =
+          std::move(shard_results.value()[si]);
+    }
   }
 
   return results;
 }
 
 bool CollectionImpl::need_switch_to_new_segment() const {
-  return writing_segment_->doc_count() >= schema_->max_doc_count_per_segment();
+  // A rotation is needed if *any* shard is at/over cap. Callers that
+  // want per-shard granularity should use the shard-aware overload.
+  for (const auto &ws : writing_segments_) {
+    if (ws && ws->doc_count() >= schema_->max_doc_count_per_segment()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CollectionImpl::need_switch_to_new_segment(size_t shard) const {
+  return writing_segments_[shard]->doc_count() >=
+         schema_->max_doc_count_per_segment();
 }
 
 Status CollectionImpl::switch_to_new_segment_for_writing(
     const CollectionSchema::Ptr &schema) {
-  auto s = writing_segment_->dump();
+  // Rotate every shard whose writing segment is at/over cap. The
+  // per-shard overload does the real work.
+  for (size_t shard = 0; shard < writing_segments_.size(); ++shard) {
+    if (!need_switch_to_new_segment(shard)) continue;
+    auto s = switch_to_new_segment_for_writing(shard, schema);
+    CHECK_RETURN_STATUS(s);
+  }
+  return Status::OK();
+}
+
+Status CollectionImpl::switch_to_new_segment_for_writing(
+    size_t shard, const CollectionSchema::Ptr &schema) {
+  auto &ws = writing_segments_[shard];
+  auto s = ws->dump();
   CHECK_RETURN_STATUS(s);
 
-  s = segment_manager_->add_segment(writing_segment_);
+  s = segment_manager_->add_segment(ws);
   CHECK_RETURN_STATUS(s);
 
   // when create new segment, segment meta should create a first new block
   // meta
   auto new_segment = Segment::CreateAndOpen(
       path_, schema == nullptr ? *schema_ : *schema, allocate_segment_id(),
-      writing_segment_->meta()->max_doc_id() + 1, id_map_, delete_store_,
+      reserve_doc_id_range_for_new_segment(), id_map_, delete_store_,
       version_manager_,
       SegmentOptions{false, options_.enable_mmap_, options_.max_buffer_size_,
                      options_.wal_durability_});
@@ -1837,13 +1945,18 @@ Status CollectionImpl::switch_to_new_segment_for_writing(
   }
 
   Version version = version_manager_->get_current_version();
-  auto writing_segment_meta = writing_segment_->meta();
+  auto writing_segment_meta = ws->meta();
   writing_segment_meta->remove_writing_forward_block();
   s = version.add_persisted_segment_meta(writing_segment_meta);
   CHECK_RETURN_STATUS(s);
 
-  writing_segment_ = new_segment.value();
-  version.reset_writing_segment_meta(writing_segment_->meta());
+  ws = new_segment.value();
+  // Phase 5 note: the manifest still persists a singular
+  // writing_segment_meta at this step; the per-shard metas are written
+  // in Step 5. For N=1 (current default) shard 0's meta IS the
+  // authoritative writing_segment_meta, matching the pre-Phase-5
+  // manifest format.
+  sync_writing_state_to_version(version);
   version.set_next_segment_id(segment_id_allocator_.load());
 
   s = version_manager_->apply(version);
@@ -1865,10 +1978,33 @@ Result<WriteResults> CollectionImpl::Delete(
   // TODO: The granularity of the write_lock is too coarse.
   std::lock_guard write_lock(write_mtx_);
 
-  // Group-commit batched delete via the segment's DeleteBatch path: one
-  // seg_mtx_ acquisition for the whole batch, one WAL group-commit
-  // fsync at the end (under PER_BATCH durability).
-  return writing_segment_->DeleteBatch(pks);
+  // Phase 5: partition pks by shard and dispatch one DeleteBatch per
+  // shard. For N=1 this is a single call, matching the Phase 2/3
+  // behaviour exactly; for N>1 each shard delete runs independently.
+  WriteResults results(pks.size());
+  const size_t n = n_shards();
+  std::vector<std::vector<std::string>> per_shard_pks(n);
+  std::vector<std::vector<size_t>> per_shard_input_idx(n);
+  for (size_t i = 0; i < pks.size(); ++i) {
+    const size_t shard = shard_of_pk(pks[i]);
+    per_shard_pks[shard].push_back(pks[i]);
+    per_shard_input_idx[shard].push_back(i);
+  }
+
+  for (size_t shard = 0; shard < n; ++shard) {
+    if (per_shard_pks[shard].empty()) continue;
+    auto seg = writing_segment_of_shard(shard);
+    auto shard_results = seg->DeleteBatch(per_shard_pks[shard]);
+    if (!shard_results.has_value()) {
+      return shard_results;
+    }
+    for (size_t si = 0; si < shard_results.value().size(); ++si) {
+      results[per_shard_input_idx[shard][si]] =
+          std::move(shard_results.value()[si]);
+    }
+  }
+
+  return results;
 }
 
 Status CollectionImpl::DeleteByFilter(const std::string &filter) {
@@ -1894,7 +2030,7 @@ Status CollectionImpl::DeleteByFilter(const std::string &filter) {
   // TODO: The granularity of the write_lock is too coarse.
   std::lock_guard write_lock(write_mtx_);
   for (auto &doc : ret.value()) {
-    Status s = writing_segment_->Delete(doc->doc_id());
+    Status s = writing_segments_[0]->Delete(doc->doc_id());
     if (!s.ok()) {
       LOG_ERROR("Delete doc_id: %zu failed", (size_t)doc->doc_id());
       return s;
@@ -2109,17 +2245,54 @@ Status CollectionImpl::recovery() {
 
   seg_options.read_only_ = options_.read_only_;
   seg_options.max_buffer_size_ = options_.max_buffer_size_;
+  seg_options.wal_durability_ = options_.wal_durability_;
 
-  // recover writing segment
-  auto writing_segment =
-      Segment::Open(path_, *schema_, *v.writing_segment_meta(), id_map_,
-                    delete_store_, version_manager_, seg_options);
-  if (!writing_segment) {
-    return writing_segment.error();
+  // Phase 5: open every shard's writing segment. The plural
+  // writing_segment_metas() is authoritative; for pre-Phase-5
+  // manifests it contains exactly one entry (migrated on load from
+  // the singular field).
+  const auto &writing_metas = v.writing_segment_metas();
+  if (writing_metas.empty()) {
+    return Status::InternalError(
+        "manifest has no writing segment meta — cannot recover");
   }
-
-  writing_segment_ = writing_segment.value();
+  writing_segments_.clear();
+  writing_segments_.resize(writing_metas.size());
+  for (size_t shard = 0; shard < writing_metas.size(); ++shard) {
+    if (!writing_metas[shard]) {
+      return Status::InternalError(
+          "manifest has a null writing segment meta for shard ",
+          (int)shard);
+    }
+    auto ws = Segment::Open(path_, *schema_, *writing_metas[shard], id_map_,
+                            delete_store_, version_manager_, seg_options);
+    if (!ws) return ws.error();
+    writing_segments_[shard] = ws.value();
+  }
   segment_id_allocator_.store(v.next_segment_id());
+
+  // Seed next_min_doc_id_. Prefer the explicit manifest field added in
+  // Phase 5; if the manifest is pre-Phase-5 (field missing / 0) fall
+  // back to computing from existing segment reservations.
+  const uint64_t persisted_watermark = v.next_min_doc_id();
+  if (persisted_watermark > 0) {
+    next_min_doc_id_.store(persisted_watermark);
+  } else {
+    const uint64_t reserve_size =
+        schema_->max_doc_count_per_segment() +
+        static_cast<uint64_t>(kMaxWriteBatchSize);
+    uint64_t next = 0;
+    auto advance_past = [&](const SegmentMeta::Ptr &m) {
+      if (!m) return;
+      const uint64_t from_min = m->min_doc_id() + reserve_size;
+      const uint64_t from_max =
+          m->max_doc_id() + 1 + static_cast<uint64_t>(kMaxWriteBatchSize);
+      next = std::max({next, from_min, from_max});
+    };
+    for (auto &m : v.persisted_segment_metas()) advance_past(m);
+    for (auto &m : writing_metas) advance_past(m);
+    next_min_doc_id_.store(next);
+  }
 
   // recover id map & delete store
   return Status::OK();
@@ -2185,24 +2358,25 @@ Status CollectionImpl::create() {
   s = init_version_manager();
   CHECK_RETURN_STATUS(s);
 
-  // create segment
+  // create segment — init_writing_segment reserves per-shard doc-id
+  // ranges and consumes N segment ids from segment_id_allocator_.
   s = init_writing_segment();
   CHECK_RETURN_STATUS(s);
 
-  // init version
+  // init version. Phase 5: next_segment_id reflects however many ids
+  // the per-shard init just consumed rather than being hardcoded to 1.
   Version version;
   version.set_schema(*schema_);
   version.set_enable_mmap(options_.enable_mmap_);
-  version.reset_writing_segment_meta(writing_segment_->meta());
+  sync_writing_state_to_version(version);
   version.set_id_map_path_suffix(0);
   version.set_delete_snapshot_path_suffix(0);
-  version.set_next_segment_id(1);
+  version.set_next_segment_id(segment_id_allocator_.load());
 
   version_manager_->apply(version);
   s = version_manager_->flush();
   CHECK_RETURN_STATUS(s);
 
-  segment_id_allocator_.store(1);
   segment_manager_ = std::make_unique<SegmentManager>();
 
   return Status::OK();
@@ -2242,15 +2416,26 @@ Status CollectionImpl::init_writing_segment() {
   options.enable_mmap_ = options_.enable_mmap_;
   options.max_buffer_size_ = options_.max_buffer_size_;
   options.read_only_ = options_.read_only_;
+  options.wal_durability_ = options_.wal_durability_;
 
-  auto writing_segment = Segment::CreateAndOpen(
-      path_, *schema_, 0, 0, id_map_, delete_store_, version_manager_, options);
+  // Phase 5: one writing segment per shard. Shard count is taken from
+  // options_.write_shards_ at create time and persisted in the manifest
+  // thereafter. Each shard reserves its own contiguous doc-id range.
+  const size_t n =
+      std::max<uint32_t>(options_.write_shards_, 1u);
+  writing_segments_.clear();
+  writing_segments_.resize(n);
 
-  if (!writing_segment) {
-    return writing_segment.error();
+  for (size_t shard = 0; shard < n; ++shard) {
+    const auto min_doc_id = reserve_doc_id_range_for_new_segment();
+    auto writing_segment = Segment::CreateAndOpen(
+        path_, *schema_, allocate_segment_id(), min_doc_id, id_map_,
+        delete_store_, version_manager_, options);
+    if (!writing_segment) {
+      return writing_segment.error();
+    }
+    writing_segments_[shard] = writing_segment.value();
   }
-
-  writing_segment_ = writing_segment.value();
 
   return Status::OK();
 }

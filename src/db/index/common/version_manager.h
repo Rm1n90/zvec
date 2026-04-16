@@ -107,12 +107,58 @@ class Version {
     return segment_metas;
   }
 
+  // Phase 5 plural API: the per-shard writing-segment metas, ordered by
+  // shard index. For pre-Phase-5 / N=1 collections this is a one-entry
+  // vector and mirrors the singular writing_segment_meta() accessor.
+  void set_writing_segment_metas(
+      const std::vector<SegmentMeta::Ptr> &metas) {
+    writing_segment_metas_ = metas;
+  }
+
+  const std::vector<SegmentMeta::Ptr> &writing_segment_metas() const {
+    return writing_segment_metas_;
+  }
+
+  // Keep the singular API stable so all pre-Phase-5 call sites still
+  // compile. Sets the plural vector to a single entry; the getter
+  // returns the first entry (or nullptr if no shards yet).
   void reset_writing_segment_meta(SegmentMeta::Ptr segment_meta) {
-    writing_segment_meta_ = segment_meta;
+    if (segment_meta) {
+      writing_segment_metas_ = {segment_meta};
+    } else {
+      writing_segment_metas_.clear();
+    }
   }
 
   SegmentMeta::Ptr writing_segment_meta() const {
-    return writing_segment_meta_;
+    return writing_segment_metas_.empty() ? SegmentMeta::Ptr{}
+                                          : writing_segment_metas_.front();
+  }
+
+  // Phase 5: immutable-after-create collection-level shard count.
+  // Missing / 0 = 1 (single unsharded collection), which preserves
+  // back-compat with pre-Phase-5 manifests.
+  void set_write_shards(uint32_t n) {
+    write_shards_ = n;
+  }
+
+  uint32_t write_shards() const {
+    if (write_shards_ > 0) return write_shards_;
+    if (!writing_segment_metas_.empty()) {
+      return static_cast<uint32_t>(writing_segment_metas_.size());
+    }
+    return 1;
+  }
+
+  // Phase 5: collection-level doc-id range allocator watermark. 0 means
+  // "unknown" and the recovery path recomputes it from existing segment
+  // ranges.
+  void set_next_min_doc_id(uint64_t v) {
+    next_min_doc_id_ = v;
+  }
+
+  uint64_t next_min_doc_id() const {
+    return next_min_doc_id_;
   }
 
   void set_id_map_path_suffix(uint32_t suffix) {
@@ -168,12 +214,21 @@ class Version {
 
   std::unordered_map<SegmentID, SegmentMeta::Ptr> persisted_segment_metas_map_;
 
-  SegmentMeta::Ptr writing_segment_meta_;
+  // Phase 5: per-shard writing-segment metas. Empty before
+  // init/recovery; exactly write_shards_ entries afterwards.
+  std::vector<SegmentMeta::Ptr> writing_segment_metas_;
 
   uint32_t id_map_path_suffix_{0};
   uint32_t delete_snapshot_path_suffix_{0};
 
   SegmentID next_segment_id_{0};
+
+  // Phase 5 additions. write_shards_ == 0 encodes "missing from the
+  // on-disk manifest" and is interpreted by write_shards() accessor
+  // (infer from metas or default 1). next_min_doc_id_ == 0 likewise
+  // encodes "missing" and triggers recompute at recovery time.
+  uint32_t write_shards_{0};
+  uint64_t next_min_doc_id_{0};
 };
 
 // Wrapper of Current Version
