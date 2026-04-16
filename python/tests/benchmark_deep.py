@@ -223,39 +223,22 @@ def bench_recall_sweep(n=50_000, n_queries=200):
         # brute-force ground truth
         scores = qvecs @ vecs.T
 
-        # NOTE: Gandiva/Arrow result materialization has an internal limit
-        # around topk=2500. Beyond that, queries fail with:
-        #   "ExecutionError in Gandiva: prepare vector failed"
-        # This is an upstream limitation, not introduced by our changes.
-        # We sweep up to 2000 (safe) and probe 5K/10K/20K to document.
         topk_values = [10, 100, 500, 1000, 2000, 5000, 10_000, 20_000]
         rows = []
         for topk in topk_values:
-            actual_topk = min(topk, n)  # can't return more than n docs
+            actual_topk = min(topk, n)
             gt = np.argsort(-scores, axis=1)[:, :actual_topk]
-            # ef must be >= topk; cap at reasonable value to avoid
-            # blowing up the HNSW candidate pool
             ef = min(max(topk, 400), n)
             lats = []
             recs = []
-            errored = False
             for qi in range(n_queries):
                 t0 = time.perf_counter()
-                try:
-                    res = c.query(VectorQuery("vec", vector=qvecs[qi].tolist(),
-                                              param=HnswQueryParam(ef=ef)), topk=topk)
-                except Exception:
-                    errored = True
-                    break
+                res = c.query(VectorQuery("vec", vector=qvecs[qi].tolist(),
+                                          param=HnswQueryParam(ef=ef)), topk=topk)
                 lats.append(time.perf_counter() - t0)
                 found = {int(d.id[1:]) for d in res}
                 truth = set(gt[qi].tolist())
                 recs.append(len(found & truth) / actual_topk if actual_topk > 0 else 1.0)
-
-            if errored:
-                rows.append({"topk": topk, "returned": "ERROR",
-                             "recall": "N/A", "mean_ms": "N/A", "p99_ms": "N/A"})
-                continue
 
             mean_lat = statistics.mean(lats)
             p99_lat = sorted(lats)[int(0.99 * len(lats))]
@@ -273,8 +256,7 @@ def bench_recall_sweep(n=50_000, n_queries=200):
             k = row["topk"]
             details[f"topk={k}"] = f"recall={row['recall']}  returned={row['returned']}  mean={row['mean_ms']}ms  p99={row['p99_ms']}ms"
 
-        valid_recalls = [float(r["recall"]) for r in rows if r["recall"] != "N/A"]
-        worst_recall = min(valid_recalls) if valid_recalls else 0.0
+        worst_recall = min(float(r["recall"]) for r in rows)
 
     return R("recall_sweep_50k", opt_sec, recall=worst_recall, details=details)
 

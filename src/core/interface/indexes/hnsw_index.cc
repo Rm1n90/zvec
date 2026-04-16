@@ -86,9 +86,9 @@ int HNSWIndex::_prepare_for_search(
   }
 
   if (0 >= hnsw_search_param->ef_search ||
-      hnsw_search_param->ef_search > 2048) {
+      hnsw_search_param->ef_search > 65536) {
     LOG_ERROR(
-        "ef_search must be greater than 0 and less than or equal to 2048.");
+        "ef_search must be greater than 0 and less than or equal to 65536.");
     return core::IndexError_Runtime;
   }
 
@@ -102,7 +102,7 @@ int HNSWIndex::_prepare_for_search(
   }
   ailego::Params params;
   const int real_search_ef =
-      std::max(1u, std::min(2048u, hnsw_search_param->ef_search));
+      std::max(1u, std::min(65536u, hnsw_search_param->ef_search));
   params.set(core::PARAM_HNSW_STREAMER_EF, real_search_ef);
   context->update(params);
   return 0;
